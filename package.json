@@ -1,7 +1,7 @@
 {
   "name": "debugproxy",
   "version": "1.0.0",
-  "description": "Proxy para auxiliar o debug no app da yvy",
+  "description": "HTTP proxy with TUI for debugging mobile and web applications",
   "keywords": [
     "debug-proxy",
     "proxy",
