@@ -1,9 +1,7 @@
 const http = require('http')
 const https = require('https')
 const fs = require('fs')
-const path = require('path')
 const tui = require('./tui')
-const printBanner = require('./consoleVisualService')
 const { getRoutes, addRoute, removeRoute } = require('./routes')
 const { shouldShow, handleCommand, filters, rebuild: rebuildFilters } = require('./filters')
 const fileLogger = require('./fileLogger')
@@ -294,17 +292,5 @@ server.on('error', err => {
 server.listen(PROXY_PORT, () => {
   const port = PROXY_PORT
   const routes = getRoutes()
-
-  process.stdout.write('\x1b[2J\x1b[H')
-  printBanner(port, routes)
-
-  if (!fs.existsSync(path.join(__dirname, 'routes.json'))) {
-    process.stdout.write(`  \u26A0  routes.json n\u00E3o encontrado, usando routes.example.json\n`)
-    process.stdout.write(`     Copie routes.example.json para routes.json com suas URLs\n\n`)
-  }
-  if (!fs.existsSync(path.join(__dirname, 'config.json'))) {
-    process.stdout.write(`  \u26A0  config.json n\u00E3o encontrado, usando defaults\n\n`)
-  }
-
-  setTimeout(() => tui.init(port, routes), 1500)
+  tui.init(port, routes)
 })
