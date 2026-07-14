@@ -1,4 +1,4 @@
-# ◉ ──── ● ──── ◉ Debug Proxy
+# o ---- * ---- o Debug Proxy
 
 > HTTP proxy com TUI interativa para debug de aplicações mobile e web.
 

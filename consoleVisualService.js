@@ -12,7 +12,7 @@ const ANSI_TO_ASCII_COLOR = {
 
 function printBanner(proxyPort, routes) {
   process.stdout.write('\n')
-  process.stdout.write(`  ${ascii.paint('\u25C9 \u2500\u2500\u2500\u2500 \u25CF \u2500\u2500\u2500\u2500 \u25C9', 'cyan', 'bold')}\n`)
+  process.stdout.write(`  ${ascii.paint('o ---- * ---- o', 'cyan', 'bold')}\n`)
   process.stdout.write(`    ${ascii.paint('DEBUG PROXY', 'yellow', 'bold')}\n\n`)
   process.stdout.write(`  ${ascii.paint('Port:', 'dim')} ${ascii.paint(String(proxyPort), 'cyan', 'bold')}  ${ascii.paint('Routes:', 'dim')} ${ascii.paint(String(routes.length), 'green', 'bold')}\n\n`)
 
