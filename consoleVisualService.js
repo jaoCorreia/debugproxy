@@ -1,14 +1,6 @@
 const ascii = require('./asciiArt')
 const { SERVICE_COLORS } = require('./colors')
 
-const LOGO = [
-  '  \u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510       \u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510',
-  '  \u2502  \u25C9 \u2502\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2502  \u25C9 \u2502',
-  '  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518       \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518',
-  '',
-  '  D E B U G   P R O X Y',
-]
-
 const ANSI_TO_ASCII_COLOR = {
   '\x1b[32m': 'green',
   '\x1b[33m': 'yellow',
@@ -20,15 +12,8 @@ const ANSI_TO_ASCII_COLOR = {
 
 function printBanner(proxyPort, routes) {
   process.stdout.write('\n')
-
-  LOGO.forEach((line, i) => {
-    if (i === 3) return process.stdout.write('\n')
-    const color = i === 4 ? 'yellow' : i <= 2 ? 'cyan' : 'white'
-    const style = i === 4 ? 'bold' : 'dim'
-    process.stdout.write(`  ${ascii.paint(line, color, style)}\n`)
-  })
-
-  process.stdout.write('\n')
+  process.stdout.write(`  ${ascii.paint('\u25C9 \u2500\u2500\u2500\u2500 \u25CF \u2500\u2500\u2500\u2500 \u25C9', 'cyan', 'bold')}\n`)
+  process.stdout.write(`    ${ascii.paint('DEBUG PROXY', 'yellow', 'bold')}\n\n`)
   process.stdout.write(`  ${ascii.paint('Port:', 'dim')} ${ascii.paint(String(proxyPort), 'cyan', 'bold')}  ${ascii.paint('Routes:', 'dim')} ${ascii.paint(String(routes.length), 'green', 'bold')}\n\n`)
 
   for (const r of routes) {
