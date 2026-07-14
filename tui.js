@@ -12,7 +12,7 @@ let PROXY_PORT = 8888
 
 function renderSidebar() {
   const routes = getRoutes()
-  let content = '{bold}{cyan-fg}Debug Proxy{/cyan-fg}{/bold}\n'
+  let content = '{cyan-fg}{bold}\u25C9 Debug Proxy{/bold}{/cyan-fg}\n'
   content += `Port: ${PROXY_PORT}\n\n`
 
   content += '{bold}Services{/bold}\n'
