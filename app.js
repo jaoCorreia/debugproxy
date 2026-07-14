@@ -32,12 +32,45 @@ function isBinary(contentType) {
   return BINARY_CONTENT_TYPES.some(t => contentType.split(';')[0].toLowerCase().startsWith(t))
 }
 
+// S\u00f3 pra conveni\u00eancia de debug local \u2014 o proxy nunca roda em produ\u00e7\u00e3o, ent\u00e3o
+// isso nunca decodifica nada fora da m\u00e1quina do dev.
+const JWT_PATTERN = /\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g
+
+function decodeJwtPayload(token) {
+  try {
+    const payloadSegment = token.split('.')[1]
+    let b64 = payloadSegment.replace(/-/g, '+').replace(/_/g, '/')
+    while (b64.length % 4) b64 += '='
+    return JSON.parse(Buffer.from(b64, 'base64').toString('utf-8'))
+  } catch {
+    return null
+  }
+}
+
+function annotateJwts(fullText) {
+  const tokens = [...new Set(fullText.match(JWT_PATTERN) || [])]
+  const blocks = tokens
+    .map(token => {
+      const payload = decodeJwtPayload(token)
+      if (!payload) return null
+      return `  ${ANSI_DIM}[JWT ${token.slice(0, 16)}\u2026 decoded]${ANSI_RESET}\n  ${JSON.stringify(payload, null, 2).replace(/\n/g, '\n  ')}`
+    })
+    .filter(Boolean)
+  return blocks.join('\n')
+}
+
 function formatBody(buf, contentType) {
   if (!buf || buf.length === 0) return ''
   if (isBinary(contentType)) return `  [binary ${buf.length.toLocaleString()} bytes]`
-  let str = buf.toString('utf-8').slice(0, MAX_BODY_LOG)
-  try { str = JSON.stringify(JSON.parse(str), null, 2) } catch {}
-  return str.length > MAX_BODY_LOG ? str.slice(0, MAX_BODY_LOG) + '\u2026' : str
+
+  const fullStr = buf.toString('utf-8')
+  let pretty = fullStr
+  try { pretty = JSON.stringify(JSON.parse(fullStr), null, 2) } catch {}
+
+  const truncated = pretty.length > MAX_BODY_LOG ? pretty.slice(0, MAX_BODY_LOG) + '\u2026' : pretty
+  const jwtAnnotations = annotateJwts(fullStr)
+
+  return jwtAnnotations ? `${truncated}\n${jwtAnnotations}` : truncated
 }
 
 function findRoute(pathname) {
