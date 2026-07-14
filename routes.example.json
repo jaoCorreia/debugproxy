@@ -1,0 +1,37 @@
+[
+  {
+    "prefix": "/agr",
+    "target": "https://your-agriculture-service.example.com/api",
+    "label": "Agriculture"
+  },
+  {
+    "prefix": "/wth",
+    "target": "https://your-weather-service.example.com/api",
+    "label": "Weather"
+  },
+  {
+    "prefix": "/frc",
+    "target": "https://fnw-us.foreca.com",
+    "label": "Foreca"
+  },
+  {
+    "prefix": "/wdc",
+    "target": "https://api.weather.com",
+    "label": "Weather.com"
+  },
+  {
+    "prefix": "/kcl",
+    "target": "https://your-auth.example.com",
+    "label": "Keycloak"
+  },
+  {
+    "prefix": "/idt",
+    "target": "https://your-identity-service.example.com",
+    "label": "Identity"
+  },
+  {
+    "prefix": "/img",
+    "target": "https://your-storage.example.com/bucket/o",
+    "label": "Images"
+  }
+]

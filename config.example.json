@@ -1,0 +1,12 @@
+{
+  "port": 8888,
+  "colors": {
+    "Agriculture": "green",
+    "Weather": "cyan",
+    "Foreca": "yellow",
+    "Weather.com": "yellow",
+    "Keycloak": "magenta",
+    "Identity": "magenta",
+    "Images": "dim"
+  }
+}
