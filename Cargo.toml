@@ -20,6 +20,7 @@ regex = "1"
 ansi-to-tui = "7"
 rand = "0.8"
 http = "1"
+arboard = { version = "3.6.1", default-features = false }
 
 [profile.release]
 lto = true
