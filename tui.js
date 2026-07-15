@@ -2,6 +2,7 @@ const blessed = require('blessed')
 const { filters, FILTER_ALIASES, handleCommand, rebuild } = require('./filters')
 const { getRoutes, addRoute, removeRoute } = require('./routes')
 const fileLogger = require('./fileLogger')
+const screensaver = require('./screensaver')
 
 let screen
 let sidebar
@@ -43,6 +44,7 @@ function renderSidebar() {
   content += '  add /pref URL Label\n'
   content += '  rm /pref\n'
   content += '  logmode day|session\n'
+  content += '  saver [cena]\n'
   content += 'q: quit  jj: jump to bottom\n'
 
   sidebar.setContent(content)
@@ -51,12 +53,14 @@ function renderSidebar() {
 
 function setupKeys() {
   screen.key(['q', 'C-c'], () => {
+    if (screensaver.handleKey()) return
     if (mode !== 'view') return
     screen.destroy()
     process.exit(0)
   })
 
   screen.key(['j', 'j'], () => {
+    if (screensaver.handleKey()) return
     if (mode !== 'view') return
     logBox.setScrollPerc(100)
     screen.render()
@@ -67,6 +71,9 @@ function setupKeys() {
   // reiniciar. Só valem fora do modo comando — senão digitar na barra
   // também dispararia os toggles.
   screen.on('keypress', ch => {
+    // Qualquer tecla acorda o screensaver e é engolida (técnica do drift:
+    // o primeiro keypress só sai da animação, não executa ação).
+    if (screensaver.handleKey()) return
     if (mode !== 'view' || !ch || ch.length !== 1) return
     const label = FILTER_ALIASES[ch]
     if (label && label in filters) {
@@ -76,6 +83,7 @@ function setupKeys() {
   })
 
   screen.key(['enter'], () => {
+    if (screensaver.handleKey()) return
     if (mode !== 'view') return
     mode = 'cmd'
     commandBar.setValue('')
@@ -112,6 +120,13 @@ function setupKeys() {
         } else {
           logBox.add(`{red-fg}${result.error}{/red-fg}`)
         }
+      } else if (action === 'saver') {
+        const sceneName = (parts[1] || '').toLowerCase()
+        if (sceneName && !screensaver.sceneNames().includes(sceneName)) {
+          logBox.add(`{yellow-fg}Cenas: ${screensaver.sceneNames().join(', ')}{/yellow-fg}`)
+        } else {
+          screensaver.start(sceneName || undefined)
+        }
       } else if (action === 'logmode' && parts.length >= 2) {
         if (parts[1] === 'day' || parts[1] === 'session') {
           fileLogger.setMode(parts[1])
@@ -123,12 +138,14 @@ function setupKeys() {
         handleCommand(cmd)
       }
       renderSidebar()
+      if (screensaver.isActive()) return
       logBox.focus()
       screen.render()
     })
   })
 
   screen.key(['escape'], () => {
+    if (screensaver.handleKey()) return
     mode = 'view'
     commandBar.setValue('')
     screen.render()
@@ -177,6 +194,16 @@ function init(port, routes) {
 
   renderSidebar()
   setupKeys()
+
+  const saverConfig = (() => {
+    try { return require('./config.json').screensaver } catch { return null }
+  })()
+  // canStart: nunca liga a animação com a barra de comando aberta.
+  screensaver.init(screen, saverConfig, {
+    canStart: () => mode === 'view',
+    onStop: () => logBox.focus(),
+  })
+
   logBox.focus()
   screen.render()
 }
@@ -189,6 +216,8 @@ function log(...args) {
   fileLogger.append(stripped)
 
   if (logBox) {
+    // Tráfego novo acorda o screensaver (configurável via wakeOnLog).
+    screensaver.logActivity()
     logBox.add(text)
     screen.render()
   }

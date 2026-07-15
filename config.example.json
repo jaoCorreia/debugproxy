@@ -8,5 +8,15 @@
     "Keycloak": "magenta",
     "Identity": "magenta",
     "Images": "dim"
+  },
+  "screensaver": {
+    "enabled": true,
+    "idleSeconds": 90,
+    "fps": 20,
+    "cycleSeconds": 60,
+    "fadeSeconds": 0.6,
+    "theme": "cosmic",
+    "scenes": "all",
+    "wakeOnLog": true
   }
 }
