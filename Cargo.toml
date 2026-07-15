@@ -1,0 +1,26 @@
+[package]
+name = "debugproxy"
+version = "1.0.0"
+edition = "2021"
+description = "HTTP proxy with ratatui TUI for debugging mobile and web applications"
+license = "MIT"
+authors = ["Joao Correia"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+base64 = "0.22"
+regex = "1"
+ansi-to-tui = "7"
+rand = "0.8"
+http = "1"
+
+[profile.release]
+lto = true
+strip = true
