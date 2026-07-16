@@ -180,3 +180,16 @@ debugproxy-rs/
   descartava o path do target — ex. `/api` — e usava só o host).
 - Mensagens de comando da TUI (`+ Route`, `Log mode`) também vão pro arquivo de log.
 - `j` (única tecla) pula pro fim do log.
+
+## Limitações conhecidas
+
+- **Compressão**: o proxy negocia a compressão com o upstream por conta própria
+  (gzip/brotli/deflate) e entrega o corpo **descomprimido** ao cliente — o
+  `accept-encoding` do cliente não é repassado. Isso mantém os logs legíveis e
+  evita bytes binários corrompendo a TUI, mas fluxos que dependem de testar a
+  negociação de compressão fim-a-fim não são observáveis através do proxy.
+- **Respostas grandes**: corpos de resposta (pós-descompressão) são limitados a
+  64MB; acima disso o proxy responde 502. Downloads muito grandes devem ser
+  feitos fora do proxy.
+- **Streaming (SSE/long-polling)**: respostas são bufferizadas por inteiro antes
+  do repasse, então Server-Sent Events não funcionam através do proxy.

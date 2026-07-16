@@ -15,9 +15,12 @@ use crate::colors::{status_color, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use crate::routes::{add_route, find_route, get_routes, remove_route, Route};
 use crate::state::AppState;
 
-const MAX_BODY_LOG: usize = 1000;
-const MAX_LOG_BODY: usize = 500;
-const MAX_RES_BUFFER: usize = 10 * 1024 * 1024;
+const MAX_LOGGED_BODY_CHARS: usize = 1000;
+const MAX_CLIENT_LOG_CHARS: usize = 500;
+const MAX_LOGGED_RES_BYTES: usize = 10 * 1024 * 1024;
+/// Hard cap on buffered (post-decompression) response bytes; protects the
+/// proxy from decompression bombs now that reqwest inflates bodies.
+const MAX_BUFFERED_RES_BYTES: usize = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 const BINARY_CONTENT_TYPES: [&str; 4] = ["image/", "video/", "audio/", "application/octet-stream"];
 
@@ -121,11 +124,30 @@ fn annotate_jwts(full_text: &str) -> String {
     blocks.join("\n")
 }
 
+/// Compressed or otherwise binary payloads can arrive under a text
+/// content-type (e.g. gzip-encoded JSON); logging them raw injects
+/// control bytes into the TUI, so sniff the content as a fallback.
+fn looks_binary(buf: &[u8]) -> bool {
+    const SNIFF_SAMPLE_BYTES: usize = 1024;
+    // Treat as binary above 1-in-20 (5%) control bytes, ignoring the
+    // whitespace and ANSI escape bytes legitimate text logs contain.
+    const CTRL_RATIO_DENOMINATOR: usize = 20;
+    let sample = &buf[..buf.len().min(SNIFF_SAMPLE_BYTES)];
+    if sample.contains(&0) {
+        return true;
+    }
+    let ctrl = sample
+        .iter()
+        .filter(|&&b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x1b))
+        .count();
+    ctrl * CTRL_RATIO_DENOMINATOR > sample.len()
+}
+
 fn format_body(buf: &[u8], content_type: &str) -> String {
     if buf.is_empty() {
         return String::new();
     }
-    if is_binary(content_type) {
+    if is_binary(content_type) || looks_binary(buf) {
         return format!("  [binary {} bytes]", format_thousands(buf.len()));
     }
     let full_str = String::from_utf8_lossy(buf).to_string();
@@ -134,8 +156,8 @@ fn format_body(buf: &[u8], content_type: &str) -> String {
         .and_then(|v| serde_json::to_string_pretty(&v).ok())
         .unwrap_or_else(|| full_str.clone());
 
-    let truncated = if pretty.chars().count() > MAX_BODY_LOG {
-        let t: String = pretty.chars().take(MAX_BODY_LOG).collect();
+    let truncated = if pretty.chars().count() > MAX_LOGGED_BODY_CHARS {
+        let t: String = pretty.chars().take(MAX_LOGGED_BODY_CHARS).collect();
         format!("{t}…")
     } else {
         pretty
@@ -199,7 +221,7 @@ fn log_response(
     if !app.filters.lock().unwrap().should_show(route_label) {
         return;
     }
-    let size_label = if body.len() > MAX_RES_BUFFER {
+    let size_label = if body.len() > MAX_LOGGED_RES_BYTES {
         format!(" [{:.1}MB, omitted]", body.len() as f64 / 1024.0 / 1024.0)
     } else {
         String::new()
@@ -207,7 +229,7 @@ fn log_response(
     app.log(&format!(
         "  {BOLD}Response:{RESET} {color}{status_code}{RESET} {DIM}{duration_ms}ms{RESET}{size_label}"
     ));
-    if !body.is_empty() && body.len() <= MAX_RES_BUFFER {
+    if !body.is_empty() && body.len() <= MAX_LOGGED_RES_BYTES {
         let ct = content_type.split(';').next().unwrap_or("");
         app.log(&format!("{DIM}  Res Body ({ct}):{RESET}"));
         let formatted = format_body(body, content_type).replace('\n', "\n  ");
@@ -230,7 +252,7 @@ async fn health(State(state): State<ServerState>) -> Json<Value> {
 
 async fn receive_log(State(state): State<ServerState>, body: axum::body::Bytes) -> Json<Value> {
     let raw = String::from_utf8_lossy(&body);
-    let truncated: String = raw.chars().take(MAX_LOG_BODY).collect();
+    let truncated: String = raw.chars().take(MAX_CLIENT_LOG_CHARS).collect();
     let ts = timestamp();
     if state.app.filters.lock().unwrap().should_show("LOG") {
         state
@@ -368,6 +390,20 @@ async fn proxy_handler(State(state): State<ServerState>, req: Request) -> Respon
     forward_request(&state, req, &route, &id, start).await
 }
 
+async fn read_body_capped(mut res: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+        if buf.len() + chunk.len() > cap {
+            return Err(format!(
+                "response body exceeded {}MB buffer cap",
+                cap / 1024 / 1024
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 async fn forward_request(
     state: &ServerState,
     req: Request,
@@ -418,7 +454,15 @@ async fn forward_request(
     let mut headers = HeaderMap::new();
     for (name, value) in parts.headers.iter() {
         let n = name.as_str().to_ascii_lowercase();
-        if n == "host" || n == "connection" || n == "keep-alive" || n == "transfer-encoding" || n == "content-length" {
+        // accept-encoding is dropped so reqwest negotiates compression itself
+        // and transparently decompresses, keeping bodies loggable as text.
+        if n == "host"
+            || n == "connection"
+            || n == "keep-alive"
+            || n == "transfer-encoding"
+            || n == "content-length"
+            || n == "accept-encoding"
+        {
             continue;
         }
         headers.insert(name.clone(), value.clone());
@@ -447,7 +491,7 @@ async fn forward_request(
                 .unwrap_or("")
                 .to_string();
 
-            match proxy_res.bytes().await {
+            match read_body_capped(proxy_res, MAX_BUFFERED_RES_BYTES).await {
                 Ok(res_body) => {
                     let duration = start.elapsed().as_millis();
                     log_response(
@@ -463,6 +507,10 @@ async fn forward_request(
                     let mut builder = Response::builder().status(status.as_u16());
                     for (name, value) in res_headers.iter() {
                         let n = name.as_str().to_ascii_lowercase();
+                        // content-encoding is intentionally forwarded: reqwest
+                        // already removed it whenever it decompressed the body,
+                        // so if still present the body is passing through
+                        // untouched (e.g. an encoding reqwest can't decode).
                         if n == "transfer-encoding" || n == "content-length" || n == "connection" {
                             continue;
                         }
@@ -499,5 +547,60 @@ async fn forward_request(
                 json_error(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_binary_detects_gzip_header() {
+        // gzip magic + zeroed MTIME field trips the NUL check
+        let gz = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+        assert!(looks_binary(&gz));
+    }
+
+    #[test]
+    fn looks_binary_allows_text_and_ansi() {
+        assert!(!looks_binary(b"{\"ok\":true}\n"));
+        assert!(!looks_binary(b"\x1b[32mGET\x1b[0m /path\r\n\tbody"));
+        assert!(!looks_binary(b""));
+    }
+
+    #[test]
+    fn looks_binary_detects_control_dense_payloads() {
+        let mut buf = vec![b'a'; 90];
+        buf.extend(std::iter::repeat(0x07).take(10)); // >5% control bytes
+        assert!(looks_binary(&buf));
+    }
+
+    #[test]
+    fn format_body_labels_binary_under_text_content_type() {
+        let gz = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert!(format_body(&gz, "application/json").contains("[binary"));
+    }
+
+    /// Network test (run with `cargo test -- --ignored`): a HEAD response
+    /// from a gzip-serving upstream carries content-encoding with an empty
+    /// body; ensures reqwest's decoder handles the empty stream instead of
+    /// erroring, which would turn HEAD requests into 502s.
+    #[tokio::test]
+    #[ignore]
+    async fn head_against_gzip_upstream_reads_empty_body() {
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let res = client
+            .head("https://api.github.com/")
+            .header("user-agent", "debugproxy-test")
+            .send()
+            .await
+            .unwrap();
+        let body = read_body_capped(res, MAX_BUFFERED_RES_BYTES).await.unwrap();
+        assert!(body.is_empty());
     }
 }

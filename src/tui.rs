@@ -19,6 +19,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::UnboundedReceiver;
+use unicode_width::UnicodeWidthChar;
 
 use crate::colors::{GREEN, RED, RESET, YELLOW};
 use crate::filters::LOGS_KEY;
@@ -55,8 +56,16 @@ struct Ui {
     tick: u64,
     flash: u8,
     log_area: Rect,
-    selected: Option<usize>,
+    selection: Option<(usize, usize)>,
+    /// Logical line where the current drag started; kept separate from
+    /// `selection` (which is normalized min/max) so reversing the drag
+    /// direction doesn't lose the original click point.
+    drag_anchor: Option<usize>,
     toast: Option<(String, u8)>,
+    /// Logical line index behind each currently rendered row, in order.
+    /// Rebuilt every frame by `draw_log` since a wrapped logical line can
+    /// span more than one row.
+    visible_rows: Vec<usize>,
 }
 
 /// Warm gradient color oscillating between terracotta, purple and pink,
@@ -130,8 +139,10 @@ fn event_loop(
         tick: 0,
         flash: 0,
         log_area: Rect::default(),
-        selected: None,
+        selection: None,
+        drag_anchor: None,
         toast: None,
+        visible_rows: Vec::new(),
     };
 
     loop {
@@ -161,6 +172,16 @@ fn event_loop(
             let overflow = ui.lines.len() - SCROLLBACK;
             ui.lines.drain(0..overflow);
             ui.scroll = ui.scroll.saturating_sub(overflow);
+            ui.selection = ui.selection.and_then(|(s, e)| {
+                if e < overflow {
+                    None
+                } else {
+                    Some((s.saturating_sub(overflow), e.saturating_sub(overflow)))
+                }
+            });
+            ui.drag_anchor = ui
+                .drag_anchor
+                .and_then(|a| if a < overflow { None } else { Some(a - overflow) });
         }
         if got_logs {
             ui.engine.log_activity();
@@ -218,7 +239,7 @@ fn event_loop(
                                 KeyCode::Down => {
                                     ui.scroll += 1;
                                 }
-                                KeyCode::Char('y') => copy_selected_line(&mut ui),
+                                KeyCode::Char('y') => copy_selection(&mut ui),
                                 KeyCode::Char(c) => {
                                     if c == 'j' {
                                         ui.follow = true;
@@ -261,6 +282,36 @@ fn event_loop(
     }
 }
 
+/// Maps a mouse row to the logical log line it displays, clamping to the
+/// log area's vertical bounds so a drag that leaves the pane still extends
+/// the selection instead of being dropped. Uses `ui.visible_rows`, the
+/// row → logical-line map `draw_log` rebuilds every frame, because a
+/// wrapped line can span more than one row.
+/// Vertical bounds of the log pane's content rows (top inclusive, bottom
+/// exclusive), excluding the pane's borders. Single source of truth for
+/// hit-testing so click and drag stay in sync.
+fn log_inner_rows(area: Rect) -> Option<(u16, u16)> {
+    if area.height <= 2 {
+        return None;
+    }
+    Some((area.y + 1, area.y + area.height - 1))
+}
+
+/// `snap_to_last` makes rows past the rendered content resolve to the last
+/// visible line — wanted while dragging (leaving the pane extends the
+/// selection) but not on click, where blank space must select nothing.
+fn row_to_line_idx(ui: &Ui, mouse_row: u16, snap_to_last: bool) -> Option<usize> {
+    let (top, bottom) = log_inner_rows(ui.log_area)?;
+    let clamped_row = mouse_row.clamp(top, bottom.saturating_sub(1));
+    let row = (clamped_row - top) as usize;
+    let idx = ui.visible_rows.get(row).copied();
+    if snap_to_last {
+        idx.or_else(|| ui.visible_rows.last().copied())
+    } else {
+        idx
+    }
+}
+
 fn handle_mouse(ui: &mut Ui, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
@@ -274,16 +325,26 @@ fn handle_mouse(ui: &mut Ui, mouse: MouseEvent) {
             let area = ui.log_area;
             let inside = mouse.column >= area.x
                 && mouse.column < area.x + area.width
-                && mouse.row > area.y
-                && mouse.row + 1 < area.y + area.height;
-            if inside {
-                let row = (mouse.row - area.y - 1) as usize;
-                let idx = ui.scroll + row;
-                if idx < ui.lines.len() {
-                    ui.selected = Some(idx);
-                    copy_selected_line(ui);
+                && log_inner_rows(area)
+                    .is_some_and(|(top, bottom)| mouse.row >= top && mouse.row < bottom);
+            match (inside, row_to_line_idx(ui, mouse.row, false)) {
+                (true, Some(idx)) => {
+                    ui.drag_anchor = Some(idx);
+                    ui.selection = Some((idx, idx));
                 }
+                _ => ui.selection = None,
             }
+        }
+        MouseEventKind::Drag(_) => {
+            if let (Some(anchor), Some(idx)) =
+                (ui.drag_anchor, row_to_line_idx(ui, mouse.row, true))
+            {
+                ui.selection = Some((anchor.min(idx), anchor.max(idx)));
+            }
+        }
+        MouseEventKind::Up(_) if ui.drag_anchor.is_some() => {
+            ui.drag_anchor = None;
+            copy_selection(ui);
         }
         _ => {}
     }
@@ -293,19 +354,60 @@ fn line_to_plain(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
-fn copy_selected_line(ui: &mut Ui) {
-    let Some(idx) = ui.selected.filter(|&i| i < ui.lines.len()) else {
+fn copy_selection(ui: &mut Ui) {
+    let Some((start, end)) = ui.selection else {
         ui.toast = Some(("Nenhuma linha selecionada".to_string(), 40));
         return;
     };
-    let text = line_to_plain(&ui.lines[idx]);
-    if text.trim().is_empty() {
+    if ui.lines.is_empty() {
         return;
     }
+    let end = end.min(ui.lines.len() - 1);
+    if start > end {
+        return;
+    }
+    let text: String = ui.lines[start..=end]
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        ui.toast = Some(("Nada para copiar (linha vazia)".to_string(), 40));
+        return;
+    }
+    let count = end - start + 1;
+    let label = if count == 1 {
+        "✓ linha copiada para a área de transferência".to_string()
+    } else {
+        format!("✓ {count} linhas copiadas para a área de transferência")
+    };
     match Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
-        Ok(()) => ui.toast = Some(("✓ linha copiada para a área de transferência".to_string(), 45)),
+        Ok(()) => ui.toast = Some((label, 45)),
         Err(_) => ui.toast = Some(("✗ falha ao copiar".to_string(), 45)),
     }
+}
+
+/// Replaces control characters with spaces so they never reach a terminal
+/// cell — a raw `\r` or backspace written mid-frame moves the cursor and
+/// smears garbage over other panes. Bidi override/isolate marks are also
+/// dropped since they visually reorder everything after them on the row.
+fn sanitize_cells(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+fn sanitize_line(line: Line<'static>) -> Line<'static> {
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|s| Span::styled(sanitize_cells(&s.content), s.style))
+        .collect::<Vec<_>>();
+    Line::from(spans)
 }
 
 fn push_line(lines: &mut Vec<Line<'static>>, raw: &str) {
@@ -314,10 +416,10 @@ fn push_line(lines: &mut Vec<Line<'static>>, raw: &str) {
             if text.lines.is_empty() {
                 lines.push(Line::default());
             } else {
-                lines.extend(text.lines);
+                lines.extend(text.lines.into_iter().map(sanitize_line));
             }
         }
-        Err(_) => lines.push(Line::raw(crate::colors::strip_ansi(raw))),
+        Err(_) => lines.push(Line::raw(sanitize_cells(&crate::colors::strip_ansi(raw)))),
     }
 }
 
@@ -452,42 +554,49 @@ fn draw_titlebar(f: &mut Frame, app: &Arc<AppState>, ui: &Ui, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
-const MASCOT_WALK: [&str; 2] = ["(o)_", "(o)-"];
-const MASCOT_JUMP: &str = "(O)^";
+const SPARK_FRAMES: [char; 6] = ['·', '✢', '✳', '✻', '✳', '✢'];
 
-/// A tiny one-eyed mascot that jogs back and forth along the sidebar floor
-/// and hops up every couple of seconds.
+/// A tiny one-eyed spark, in the spirit of the Claude Code CLI's pulsing
+/// star spinner: a single glowing glyph that breathes through star shapes,
+/// drifts back and forth across the sidebar floor, bobs between the two
+/// rows, and leaves a faint trailing glint behind it.
 fn draw_mascot(lines: &mut Vec<Line<'static>>, inner_width: usize, tick: u64) {
     let width = inner_width.max(6);
-    let sprite_len = 4usize;
-    let span = width.saturating_sub(sprite_len).max(1) as u64;
+    let span = width.saturating_sub(1).max(1) as u64;
     let period = span * 2;
-    let step = (tick / 4) % period.max(1);
-    let pos = if step <= span { step } else { period - step } as usize;
-
-    let jumping = tick % 180 < 12;
-    let sprite = if jumping {
-        MASCOT_JUMP
+    let step = (tick / 3) % period.max(1);
+    let rising = step <= span;
+    let pos = (if rising { step } else { period - step }) as usize;
+    let trail_pos = if rising {
+        pos.saturating_sub(1)
     } else {
-        MASCOT_WALK[(tick as usize / 4) % 2]
+        (pos + 1).min(width - 1)
     };
 
-    let mut air: Vec<char> = vec![' '; width];
-    let mut ground: Vec<char> = vec!['·'; width];
-    let row = if jumping { &mut air } else { &mut ground };
-    for (i, c) in sprite.chars().enumerate() {
-        if pos + i < row.len() {
-            row[pos + i] = c;
-        }
+    let bob_top = (tick / 9) % 2 == 0;
+    let glyph = SPARK_FRAMES[(tick as usize / 3) % SPARK_FRAMES.len()];
+    let color = wave_color(pos, tick);
+
+    let mut spark_row: Vec<char> = vec![' '; width];
+    let mut trail_row: Vec<char> = vec![' '; width];
+    spark_row[pos] = glyph;
+    if trail_pos != pos {
+        trail_row[trail_pos] = '·';
     }
 
-    let air_str: String = air.into_iter().collect();
-    let ground_str: String = ground.into_iter().collect();
-    lines.push(Line::styled(
-        format!(" {air_str}"),
-        Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
-    ));
-    lines.push(Line::styled(format!(" {ground_str}"), Style::default().fg(MUTED)));
+    let spark_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let trail_style = Style::default().fg(MUTED);
+
+    let (top, top_style, bottom, bottom_style) = if bob_top {
+        (spark_row, spark_style, trail_row, trail_style)
+    } else {
+        (trail_row, trail_style, spark_row, spark_style)
+    };
+
+    let top_str: String = top.into_iter().collect();
+    let bottom_str: String = bottom.into_iter().collect();
+    lines.push(Line::styled(format!(" {top_str}"), top_style));
+    lines.push(Line::styled(format!(" {bottom_str}"), bottom_style));
 }
 
 fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &Ui, area: Rect) {
@@ -497,7 +606,8 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &Ui, area: Rect) {
     let heading = Style::default().fg(VIOLET).add_modifier(Modifier::BOLD);
     let mut lines: Vec<Line> = Vec::new();
 
-    draw_mascot(&mut lines, (SIDEBAR_WIDTH as usize).saturating_sub(4), ui.tick);
+    // Inner width minus borders, padding and the mascot's leading space.
+    draw_mascot(&mut lines, (SIDEBAR_WIDTH as usize).saturating_sub(5), ui.tick);
     lines.push(Line::default());
 
     lines.push(Line::styled("▸ Services", heading));
@@ -598,27 +708,115 @@ fn highlight_line(line: &Line<'static>) -> Line<'static> {
     )
 }
 
+/// Word-wraps a single logical line into as many display rows as needed to
+/// fit `width` columns, splitting on character boundaries and preserving
+/// each character's style. Never truncates.
+///
+/// Known limitation: splitting per `char` breaks grapheme clusters across
+/// spans (combining accents, ZWJ emoji render degraded). Fixing it means
+/// segmenting with unicode-segmentation instead of `chars()`.
+fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![Line::default()];
+    }
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut col = 0usize;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w > 0 && col + w > width {
+                rows.push(Vec::new());
+                col = 0;
+            }
+            rows.last_mut()
+                .unwrap()
+                .push(Span::styled(ch.to_string(), span.style));
+            col += w;
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
+}
+
+/// Wraps logical lines forward from `start`, pairing each display row with
+/// the logical line index it came from, until `viewport` rows are filled or
+/// the buffer runs out.
+fn build_display_rows(
+    lines: &[Line<'static>],
+    start: usize,
+    viewport: usize,
+    width: usize,
+) -> Vec<(usize, Line<'static>)> {
+    let mut rows = Vec::with_capacity(viewport);
+    let mut idx = start;
+    while idx < lines.len() && rows.len() < viewport {
+        for wrapped in wrap_line(&lines[idx], width) {
+            if rows.len() >= viewport {
+                break;
+            }
+            rows.push((idx, wrapped));
+        }
+        idx += 1;
+    }
+    rows
+}
+
+/// Wraps logical lines backward from the end of the buffer so the most
+/// recent `viewport` display rows are always shown in full, used for
+/// follow mode where a long wrapped tail line must not get clipped.
+fn build_tail_rows(lines: &[Line<'static>], viewport: usize, width: usize) -> Vec<(usize, Line<'static>)> {
+    let mut rows: Vec<(usize, Line<'static>)> = Vec::new();
+    let mut idx = lines.len();
+    while idx > 0 && rows.len() < viewport {
+        idx -= 1;
+        let mut wrapped: Vec<(usize, Line<'static>)> = wrap_line(&lines[idx], width)
+            .into_iter()
+            .map(|l| (idx, l))
+            .collect();
+        wrapped.extend(rows);
+        rows = wrapped;
+        if rows.len() > viewport {
+            let excess = rows.len() - viewport;
+            rows.drain(0..excess);
+        }
+    }
+    rows
+}
+
 fn draw_log(f: &mut Frame, ui: &mut Ui, area: Rect) {
     ui.log_area = area;
     let viewport = area.height.saturating_sub(2) as usize;
-    let max_scroll = ui.lines.len().saturating_sub(viewport);
-    if ui.scroll >= max_scroll {
-        ui.scroll = max_scroll;
-        ui.follow = true;
-    }
-    if ui.follow {
-        ui.scroll = max_scroll;
-    }
+    let width = area.width.saturating_sub(2) as usize;
 
-    let end = (ui.scroll + viewport).min(ui.lines.len());
-    let visible: Vec<Line> = ui.lines[ui.scroll..end]
-        .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            if Some(ui.scroll + i) == ui.selected {
-                highlight_line(l)
+    // The bottom-most scroll position is the logical index of the first
+    // tail row, which accounts for wrapping — a plain `len - viewport`
+    // would snap into follow mode too early when tail lines wrap.
+    let rows = if ui.follow {
+        build_tail_rows(&ui.lines, viewport, width)
+    } else {
+        let tail = build_tail_rows(&ui.lines, viewport, width);
+        let bottom_start = tail.first().map(|(idx, _)| *idx).unwrap_or(0);
+        if ui.scroll >= bottom_start {
+            ui.follow = true;
+            tail
+        } else {
+            build_display_rows(&ui.lines, ui.scroll, viewport, width)
+        }
+    };
+    if let Some((idx, _)) = rows.first() {
+        ui.scroll = *idx;
+    }
+    ui.visible_rows = rows.iter().map(|(idx, _)| *idx).collect();
+
+    let visible: Vec<Line> = rows
+        .into_iter()
+        .map(|(idx, line)| {
+            let selected = ui
+                .selection
+                .is_some_and(|(start, end)| idx >= start && idx <= end);
+            if selected {
+                highlight_line(&line)
             } else {
-                l.clone()
+                line
             }
         })
         .collect();
@@ -631,7 +829,7 @@ fn draw_log(f: &mut Frame, ui: &mut Ui, area: Rect) {
     let title = if ui.follow {
         " logs · following "
     } else {
-        " logs · click a line to copy "
+        " logs · click or drag to copy "
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -723,5 +921,52 @@ fn draw_screensaver(f: &mut Frame, engine: &mut Engine) {
                 (rgb[2] * t).round() as u8,
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(rows: &[Line<'static>]) -> Vec<String> {
+        rows.iter().map(line_to_plain).collect()
+    }
+
+    #[test]
+    fn sanitize_cells_replaces_control_and_bidi_chars() {
+        assert_eq!(sanitize_cells("a\rb\tc\u{8}d"), "a b c d");
+        assert_eq!(sanitize_cells("x\u{202E}y\u{2066}z"), "x y z");
+        assert_eq!(sanitize_cells("normal ✓ text"), "normal ✓ text");
+    }
+
+    #[test]
+    fn wrap_line_splits_at_width() {
+        let rows = wrap_line(&Line::raw("abcdef"), 4);
+        assert_eq!(plain(&rows), vec!["abcd", "ef"]);
+    }
+
+    #[test]
+    fn wrap_line_accounts_for_wide_chars() {
+        // '🚀' is width 2: it must not straddle the row boundary.
+        let rows = wrap_line(&Line::raw("abc🚀d"), 4);
+        assert_eq!(plain(&rows), vec!["abc", "🚀d"]);
+    }
+
+    #[test]
+    fn wrap_line_zero_width_never_starts_a_row() {
+        // combining acute accent (width 0) stays with its base char
+        let rows = wrap_line(&Line::raw("ab\u{301}cd"), 2);
+        assert_eq!(plain(&rows), vec!["ab\u{301}", "cd"]);
+    }
+
+    #[test]
+    fn build_tail_rows_keeps_wrapped_tail_visible() {
+        let lines = vec![Line::raw("first"), Line::raw("0123456789")];
+        // viewport of 2 rows, width 4: tail line wraps into 3 rows; the
+        // last 2 rows of the buffer must be shown, both from index 1.
+        let rows = build_tail_rows(&lines, 2, 4);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(idx, _)| *idx == 1));
+        assert_eq!(line_to_plain(&rows[1].1), "89");
     }
 }
