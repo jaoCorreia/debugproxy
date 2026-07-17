@@ -23,6 +23,9 @@ http = "1"
 arboard = { version = "3.6.1", default-features = false }
 unicode-width = "0.2"
 
+[build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 lto = true
 strip = true
