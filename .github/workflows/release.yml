@@ -66,7 +66,7 @@ jobs:
         shell: bash
         run: |
           echo '1 ICON "assets/debugproxy.ico"' > resource.rc
-          rc.exe /nologo /fo resource.res resource.rc
+          rc resource.rc
           echo "Windows resource compiled successfully"
 
       - name: Validate version
