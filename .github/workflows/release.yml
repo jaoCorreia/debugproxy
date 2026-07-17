@@ -87,6 +87,11 @@ jobs:
         shell: bash
         run: cp scripts/remove-quarantine.sh dist/
 
+      - name: Add launcher batch file (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cp debugproxy.bat dist/
+
       - name: Package
         shell: bash
         run: |

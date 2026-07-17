@@ -16,7 +16,29 @@ use filters::Filters;
 use logger::FileLogger;
 use state::AppState;
 
+fn pause_on_exit() {
+    #[cfg(target_os = "windows")]
+    {
+        eprintln!("\nPress Enter to close...");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+}
+
 fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("FATAL: {info}");
+        eprintln!("{msg}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("debugproxy-crash.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{msg}");
+            eprintln!("Crash details written to debugproxy-crash.log");
+        }
+    }));
+
     let cfg = config::load();
     let port = config::resolve_port(&cfg);
 
@@ -43,6 +65,8 @@ fn main() {
 
     if let Err(e) = tui::run(app, rx) {
         eprintln!("TUI error: {e}");
+        pause_on_exit();
         std::process::exit(1);
     }
+    pause_on_exit();
 }
