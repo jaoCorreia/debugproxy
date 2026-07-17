@@ -65,35 +65,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          cat > resource.rc << 'RCEOF'
-          #include <winresrc.h>
-          LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
-          1 ICON "assets/debugproxy.ico"
-          VS_VERSION_INFO VERSIONINFO
-          FILEVERSION 1,0,4,0
-          PRODUCTVERSION 1,0,4,0
-          FILEFLAGSMASK 0x3fL
-          FILEFLAGS 0
-          FILEOS VOS_NT_WINDOWS32
-          FILETYPE VFT_APP
-          FILESUBTYPE 0
-          BEGIN
-            BLOCK "StringFileInfo"
-            BEGIN
-              BLOCK "040904B0"
-              BEGIN
-                VALUE "FileDescription", "Debug Proxy - HTTP proxy with TUI"
-                VALUE "ProductName", "Debug Proxy"
-                VALUE "CompanyName", "debugproxy"
-              END
-            END
-            BLOCK "VarFileInfo"
-            BEGIN
-              VALUE "Translation", 0x0409, 1200
-            END
-          END
-          RCEOF
-          rc.exe /fo resource.res resource.rc
+          echo '1 ICON "assets/debugproxy.ico"' > resource.rc
+          rc.exe /nologo /fo resource.res resource.rc
           echo "Windows resource compiled successfully"
 
       - name: Validate version
