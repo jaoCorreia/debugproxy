@@ -28,11 +28,6 @@ jobs:
             pkg_name: debugproxy-windows-x86_64
 
           - os: macos-latest
-            target: x86_64-apple-darwin
-            suffix: ""
-            pkg_name: debugproxy-macos-x86_64
-
-          - os: macos-latest
             target: aarch64-apple-darwin
             suffix: ""
             pkg_name: debugproxy-macos-aarch64
