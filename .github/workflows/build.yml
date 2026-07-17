@@ -27,7 +27,7 @@ jobs:
             suffix: .exe
             pkg_name: debugproxy-windows-x86_64
 
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             suffix: ""
             pkg_name: debugproxy-macos-x86_64

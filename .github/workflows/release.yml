@@ -1,14 +1,15 @@
 name: Release
 
-# Cutting a `v*` tag is the trigger: build the binary on each OS and attach the
-# archives to a GitHub Release for that tag. No tag, no release.
 on:
   push:
+    branches: [main]
     tags:
       - 'v*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  # softprops/action-gh-release needs write to create the release and upload.
   contents: write
 
 env:
@@ -47,6 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Validate version
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
@@ -89,6 +91,7 @@ jobs:
           fi
 
       - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           # Only one of these exists per OS; the glob quietly skips the other.
