@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -76,15 +76,60 @@ impl FileLogger {
     }
 
     pub fn read_tail(&self, lines: usize) -> String {
-        let file = self.resolve_file();
-        if let Some(ref path) = file {
-            if let Ok(raw) = fs::read_to_string(path) {
-                let all: Vec<&str> = raw.lines().collect();
-                let start = if all.len() > lines { all.len() - lines } else { 0 };
-                return all[start..].join("\n");
-            }
+        if lines == 0 {
+            return String::new();
         }
-        "(sem logs ainda)".to_string()
+        let file = self.resolve_file();
+        let Some(path) = file else {
+            return String::new();
+        };
+        let mut f = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return String::new(),
+        };
+        let file_size = match f.seek(SeekFrom::End(0)) {
+            Ok(s) => s,
+            Err(_) => return String::new(),
+        };
+        if file_size == 0 {
+            return String::new();
+        }
+        let chunk_size = 4096u64;
+        let mut buf = Vec::new();
+        let mut pos = file_size;
+        let mut line_count = 0usize;
+        while pos > 0 && line_count <= lines {
+            let read_size = chunk_size.min(pos) as usize;
+            pos -= read_size as u64;
+            if f.seek(SeekFrom::Start(pos)).is_err() {
+                break;
+            }
+            let mut chunk = vec![0u8; read_size];
+            if f.read_exact(&mut chunk).is_err() {
+                break;
+            }
+            let mut new_buf = chunk;
+            new_buf.extend_from_slice(&buf);
+            buf = new_buf;
+            line_count = buf.iter().filter(|&&b| b == b'\n').count();
+        }
+        let buf_str = match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(_) => return String::new(),
+        };
+        if line_count > lines {
+            let skip = line_count - lines;
+            let mut idx = 0;
+            for _ in 0..skip {
+                match buf_str[idx..].find('\n') {
+                    Some(offset) => idx += offset + 1,
+                    None => break,
+                }
+            }
+            buf_str[idx..].to_string()
+        } else {
+            buf_str
+        }
     }
 
     fn day_key(d: chrono::DateTime<chrono::Local>) -> String {

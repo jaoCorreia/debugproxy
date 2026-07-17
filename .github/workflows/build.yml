@@ -50,28 +50,11 @@ jobs:
       - name: Build
         run: |
           cargo build --release --locked --target ${{ matrix.target }}
-          cp target/${{ matrix.target }}/release/debugproxy${{ matrix.suffix }} debugproxy-${{ matrix.pkg_name }}${{ matrix.suffix }}
+          cp target/${{ matrix.target }}/release/debugproxy${{ matrix.suffix }} ${{ matrix.pkg_name }}${{ matrix.suffix }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.pkg_name }}
-          path: debugproxy-${{ matrix.pkg_name }}${{ matrix.suffix }}
+          path: ${{ matrix.pkg_name }}${{ matrix.suffix }}
           if-no-files-found: error
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: artifacts/**/*

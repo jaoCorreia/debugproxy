@@ -154,6 +154,11 @@ fn event_loop(
         search_area: Rect::default(),
     };
 
+    let tail = app.logger.read_tail(SCROLLBACK);
+    for part in tail.split('\n') {
+        push_line(&mut ui.lines, part);
+    }
+
     loop {
         ui.tick = ui.tick.wrapping_add(1);
         if ui.flash > 0 {

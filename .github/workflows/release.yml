@@ -46,11 +46,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Validate version
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "ERROR: tag v${TAG_VERSION} does not match Cargo.toml version ${CARGO_VERSION}"
+            exit 1
+          fi
+          echo "✓ tag v${TAG_VERSION} == Cargo.toml ${CARGO_VERSION}"
+
       - name: Build
         shell: bash
         run: |
           for target in ${{ matrix.targets }}; do
-            cargo build --release --target "$target"
+            cargo build --release --locked --target "$target"
           done
 
       - name: Assemble binary

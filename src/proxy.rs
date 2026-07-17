@@ -283,7 +283,15 @@ async fn api_status(State(state): State<ServerState>) -> Response {
 }
 
 async fn api_logs(State(state): State<ServerState>) -> Response {
-    let content = state.app.logger.read_tail(51);
+    let app = state.app.clone();
+    let content = tokio::task::spawn_blocking(move || app.logger.read_tail(51))
+        .await
+        .unwrap_or_default();
+    let content = if content.is_empty() {
+        "(sem logs ainda)".to_string()
+    } else {
+        content
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; charset=utf-8")
