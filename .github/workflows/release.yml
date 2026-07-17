@@ -79,6 +79,11 @@ jobs:
             cp "target/${targets[0]}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
           fi
 
+      - name: Add quarantine-removal helper (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: cp scripts/remove-quarantine.sh dist/
+
       - name: Package
         shell: bash
         run: |
