@@ -1,6 +1,6 @@
 [package]
 name = "debugproxy"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "HTTP proxy with ratatui TUI for debugging mobile and web applications"
 license = "MIT"

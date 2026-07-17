@@ -42,6 +42,12 @@ fn main() {
     let cfg = config::load();
     let port = config::resolve_port(&cfg);
 
+    if let Err(e) = std::net::TcpListener::bind(("0.0.0.0", port)) {
+        eprintln!("Port {port} is in use or unavailable: {e}");
+        pause_on_exit();
+        std::process::exit(1);
+    }
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     let app = Arc::new(AppState {

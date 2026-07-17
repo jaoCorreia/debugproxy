@@ -118,13 +118,21 @@ pub fn run(app: Arc<AppState>, rx: UnboundedReceiver<String>) -> io::Result<()> 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
+    struct CleanupGuard;
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        }
+    }
+    let _guard = CleanupGuard;
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = event_loop(&mut terminal, app, rx);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     res
 }

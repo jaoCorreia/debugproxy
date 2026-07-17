@@ -13,7 +13,28 @@ Baixe o binário pronto para seu sistema na [página de releases](https://github
 | 🪟 Windows (x86_64) | [debugproxy-windows-x86_64.zip](https://github.com/jaoCorreia/debugproxy/releases/latest/download/debugproxy-windows-x86_64.zip) |
 | 🍎 macOS (Apple Silicon) | [debugproxy-macos-aarch64.tar.gz](https://github.com/jaoCorreia/debugproxy/releases/latest/download/debugproxy-macos-aarch64.tar.gz) |
 
-Descompacte e execute o binário no diretório com seus `routes.json` e `config.json`.
+### Windows
+
+> No Windows, **não dê duplo clique no `.exe`**. Use o `debugproxy.bat` incluído no `.zip`. Ele evita o bloqueio do SmartScreen e mantém a janela aberta se der erro.
+
+1. Extraia o `.zip` para uma pasta
+2. Copie `config.example.json` → `config.json` (edite se quiser mudar a porta)
+3. Copie `routes.example.json` → `routes.json` (adicione suas rotas)
+4. Execute `debugproxy.bat` (duplo clique ou pelo terminal)
+5. Se o Windows SmartScreen bloquear, clique em **"Mais informações" → "Executar mesmo assim"**, ou use o `.bat`
+
+Requer **Windows 10 build 1909+** e **Windows Terminal** (recomendado para cores e Unicode).
+
+### Linux / macOS
+
+```bash
+tar xzf debugproxy-*.tar.gz
+cp config.example.json config.json
+cp routes.example.json routes.json
+./debugproxy
+```
+
+No macOS, se o Gatekeeper bloquear, execute `./remove-quarantine.sh` primeiro.
 
 ### Build from source
 

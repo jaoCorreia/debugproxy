@@ -53,11 +53,13 @@ pub async fn run(app: Arc<AppState>) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Porta {} em uso ou indisponível: {e}", app.port);
-            std::process::exit(1);
+            app.log(&format!("{RED}Porta {} em uso: {e}{RESET}", app.port));
+            return;
         }
     };
-    axum::serve(listener, router).await.expect("server");
+    if let Err(e) = axum::serve(listener, router).await {
+        app.log(&format!("{RED}Server error: {e}{RESET}"));
+    }
 }
 
 fn timestamp() -> String {
