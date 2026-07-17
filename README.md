@@ -3,14 +3,25 @@
 > HTTP proxy com TUI interativa (ratatui) para debug de aplicações mobile e web.
 > Reescrita em Rust da versão Node.js.
 
-## Instalação
+## Download
+
+Baixe o binário pronto para seu sistema na [página de releases](https://github.com/jaoCorreia/debugproxy/releases/latest):
+
+| Plataforma | Download |
+|---|---|
+| 🐧 Linux (x86_64) | [debugproxy-linux-x86_64.tar.gz](https://github.com/jaoCorreia/debugproxy/releases/latest/download/debugproxy-linux-x86_64.tar.gz) |
+| 🪟 Windows (x86_64) | [debugproxy-windows-x86_64.zip](https://github.com/jaoCorreia/debugproxy/releases/latest/download/debugproxy-windows-x86_64.zip) |
+| 🍎 macOS (Universal) | [debugproxy-macos-universal.tar.gz](https://github.com/jaoCorreia/debugproxy/releases/latest/download/debugproxy-macos-universal.tar.gz) |
+
+Descompacte e execute o binário no diretório com seus `routes.json` e `config.json`.
+
+### Build from source
 
 ```bash
-git clone <repo>
-cd debugproxy-rs
+git clone https://github.com/jaoCorreia/debugproxy.git
+cd debugproxy
 cp routes.example.json routes.json
 cp config.example.json config.json
-# edite routes.json com suas URLs reais
 cargo build --release
 ```
 
