@@ -52,12 +52,14 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # Git for Windows ships /usr/bin/link.exe which shadows the MSVC linker.
-          # The cc crate picks it up and linking fails. Move it out of the way.
           if [ -f "C:/Program Files/Git/usr/bin/link.exe" ]; then
             mv "C:/Program Files/Git/usr/bin/link.exe" "C:/Program Files/Git/usr/bin/link.exe.bak"
             echo "Moved Git link.exe out of PATH"
           fi
+
+      - name: Setup MSVC developer environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Validate version
         if: startsWith(github.ref, 'refs/tags/v')
