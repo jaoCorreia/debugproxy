@@ -44,6 +44,7 @@ const FLASH_FRAMES: u8 = 8;
 enum Mode {
     View,
     Command,
+    Search,
 }
 
 struct Ui {
@@ -66,6 +67,10 @@ struct Ui {
     /// Rebuilt every frame by `draw_log` since a wrapped logical line can
     /// span more than one row.
     visible_rows: Vec<usize>,
+    search_term: Option<String>,
+    search_matches: Vec<usize>,
+    search_cursor: usize,
+    search_area: Rect,
 }
 
 /// Warm gradient color oscillating between terracotta, purple and pink,
@@ -143,6 +148,10 @@ fn event_loop(
         drag_anchor: None,
         toast: None,
         visible_rows: Vec::new(),
+        search_term: None,
+        search_matches: Vec::new(),
+        search_cursor: 0,
+        search_area: Rect::default(),
     };
 
     loop {
@@ -182,15 +191,34 @@ fn event_loop(
             ui.drag_anchor = ui
                 .drag_anchor
                 .and_then(|a| if a < overflow { None } else { Some(a - overflow) });
+            if !ui.search_matches.is_empty() {
+                let old_cursor = ui.search_matches.get(ui.search_cursor).copied();
+                ui.search_matches
+                    .retain(|idx| *idx >= overflow);
+                for idx in &mut ui.search_matches {
+                    *idx -= overflow;
+                }
+                ui.search_cursor = old_cursor
+                    .and_then(|c| {
+                        let adj = c.saturating_sub(overflow);
+                        ui.search_matches
+                            .iter()
+                            .position(|m| *m == adj)
+                    })
+                    .unwrap_or(0);
+            }
         }
         if got_logs {
             ui.engine.log_activity();
             ui.flash = FLASH_FRAMES;
+            if ui.search_term.as_ref().is_some_and(|t| !t.is_empty()) {
+                update_search(&mut ui);
+            }
         }
 
         let size = terminal.size()?;
         ui.engine.check_idle(
-            ui.mode == Mode::View,
+            ui.mode == Mode::View || ui.mode == Mode::Search,
             size.width as usize,
             size.height as usize,
         );
@@ -240,6 +268,22 @@ fn event_loop(
                                     ui.scroll += 1;
                                 }
                                 KeyCode::Char('y') => copy_selection(&mut ui),
+                                KeyCode::Char('/') => {
+                                    ui.mode = Mode::Search;
+                                    ui.input = ui.search_term.clone().unwrap_or_default();
+                                    update_search(&mut ui);
+                                }
+                                KeyCode::Char('n') if ui.search_term.as_ref().is_some_and(|t| !t.is_empty()) => {
+                                    navigate_search(&mut ui, true);
+                                }
+                                KeyCode::Char('N') if ui.search_term.as_ref().is_some_and(|t| !t.is_empty()) => {
+                                    navigate_search(&mut ui, false);
+                                }
+                                KeyCode::Esc if ui.search_term.as_ref().is_some_and(|t| !t.is_empty()) => {
+                                    ui.search_term = None;
+                                    ui.search_matches.clear();
+                                    ui.search_cursor = 0;
+                                }
                                 KeyCode::Char(c) => {
                                     if c == 'j' {
                                         ui.follow = true;
@@ -271,6 +315,44 @@ fn event_loop(
                             }
                             KeyCode::Char(c) => {
                                 ui.input.push(c);
+                            }
+                            _ => {}
+                        },
+                        Mode::Search => match key.code {
+                            KeyCode::Char('y') => copy_selection(&mut ui),
+                            KeyCode::Esc => {
+                                ui.search_term = None;
+                                ui.search_matches.clear();
+                                ui.search_cursor = 0;
+                                ui.input.clear();
+                                ui.mode = Mode::View;
+                            }
+                            KeyCode::Enter => {
+                                let trimmed = ui.input.trim().to_string();
+                                if trimmed.is_empty() {
+                                    ui.search_term = None;
+                                    ui.search_matches.clear();
+                                    ui.search_cursor = 0;
+                                } else {
+                                    ui.search_term = Some(trimmed);
+                                    ui.input = ui.search_term.clone().unwrap_or_default();
+                                }
+                                ui.mode = Mode::View;
+                            }
+                            KeyCode::Backspace => {
+                                ui.input.pop();
+                                if ui.input.is_empty() {
+                                    ui.search_matches.clear();
+                                    ui.search_cursor = 0;
+                                } else {
+                                    ui.search_term = Some(ui.input.clone());
+                                    update_search(&mut ui);
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                ui.input.push(c);
+                                ui.search_term = Some(ui.input.clone());
+                                update_search(&mut ui);
                             }
                             _ => {}
                         },
@@ -322,6 +404,18 @@ fn handle_mouse(ui: &mut Ui, mouse: MouseEvent) {
             ui.scroll += 3;
         }
         MouseEventKind::Down(_) => {
+            let clicked_search = ui.search_term.as_ref().is_some_and(|t| !t.is_empty())
+                && ui.mode == Mode::View
+                && mouse.column >= ui.search_area.x
+                && mouse.column < ui.search_area.x + ui.search_area.width
+                && ui.search_area.height > 2
+                && mouse.row > ui.search_area.y
+                && mouse.row < ui.search_area.y + ui.search_area.height - 1;
+            if clicked_search {
+                ui.mode = Mode::Search;
+                ui.input = ui.search_term.clone().unwrap_or_default();
+                return;
+            }
             let area = ui.log_area;
             let inside = mouse.column >= area.x
                 && mouse.column < area.x + area.width
@@ -477,6 +571,11 @@ fn execute_command(app: &Arc<AppState>, ui: &mut Ui, cmd: &str, w: u16, h: u16) 
         } else {
             app.log(&format!("{YELLOW}Use: logmode day|session{RESET}"));
         }
+    } else if action == "search" && parts.len() >= 2 {
+        let term = parts[1..].join(" ");
+        ui.search_term = Some(term.clone());
+        ui.input = term;
+        update_search(ui);
     } else {
         app.filters.lock().unwrap().handle_command(cmd);
     }
@@ -488,24 +587,49 @@ fn draw(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui) {
         return;
     }
 
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(3),
-        ])
-        .split(f.area());
+    let has_search = ui.search_term.as_ref().is_some_and(|t| !t.is_empty());
 
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
-        .split(outer[1]);
+    let outer = if has_search {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(3),
+            ])
+            .split(f.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(3),
+            ])
+            .split(f.area())
+    };
 
-    draw_titlebar(f, app, ui, outer[0]);
-    draw_sidebar(f, app, ui, top[0]);
-    draw_log(f, ui, top[1]);
-    draw_command_bar(f, ui, outer[2]);
+    if has_search {
+        draw_titlebar(f, app, ui, outer[0]);
+        draw_search_bar(f, ui, outer[1]);
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
+            .split(outer[2]);
+        draw_sidebar(f, app, ui, top[0]);
+        draw_log(f, ui, top[1]);
+        draw_command_bar(f, ui, outer[3]);
+    } else {
+        draw_titlebar(f, app, ui, outer[0]);
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
+            .split(outer[1]);
+        draw_sidebar(f, app, ui, top[0]);
+        draw_log(f, ui, top[1]);
+        draw_command_bar(f, ui, outer[2]);
+    }
 }
 
 fn draw_titlebar(f: &mut Frame, app: &Arc<AppState>, ui: &Ui, area: Rect) {
@@ -552,6 +676,61 @@ fn draw_titlebar(f: &mut Frame, app: &Arc<AppState>, ui: &Ui, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT_SOFT));
     f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+fn draw_search_bar(f: &mut Frame, ui: &mut Ui, area: Rect) {
+    ui.search_area = area;
+    let is_typing = ui.mode == Mode::Search;
+    let border_color = if is_typing { ACCENT } else { ACCENT_SOFT };
+
+    let term = ui.search_term.as_deref().unwrap_or("");
+    let count_text = if term.is_empty() {
+        "(type to search)".to_string()
+    } else if ui.search_matches.is_empty() {
+        "(0 matches)".to_string()
+    } else {
+        let current = if ui.search_cursor < ui.search_matches.len() {
+            ui.search_cursor + 1
+        } else {
+            ui.search_matches.len()
+        };
+        let total = ui.search_matches.len();
+        format!("({current}/{total} matches)")
+    };
+
+    let content = if is_typing {
+        let cursor = if ui.tick / 5 % 2 == 0 { "█" } else { " " };
+        Line::from(vec![
+            Span::styled("/ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(ui.input.clone(), Style::default().fg(Color::White)),
+            Span::styled(cursor, Style::default().fg(ACCENT)),
+            Span::raw("    "),
+            Span::styled(count_text, Style::default().fg(MUTED)),
+            Span::raw("  "),
+            Span::styled("ESC cancel", Style::default().fg(MUTED)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("/ ", Style::default().fg(ACCENT_SOFT)),
+            Span::styled(term, Style::default().fg(Color::White)),
+            Span::raw("    "),
+            Span::styled(&count_text, Style::default().fg(MUTED)),
+            Span::raw("  "),
+            Span::styled("click or / to edit", Style::default().fg(MUTED)),
+            Span::raw("  "),
+            Span::styled("n next", Style::default().fg(MUTED)),
+            Span::raw("  "),
+            Span::styled("N prev", Style::default().fg(MUTED)),
+            Span::raw("  "),
+            Span::styled("ESC clear", Style::default().fg(MUTED)),
+        ])
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+    f.render_widget(Paragraph::new(content).block(block), area);
 }
 
 const SPARK_FRAMES: [char; 6] = ['·', '✢', '✳', '✻', '✳', '✢'];
@@ -676,7 +855,9 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &Ui, area: Rect) {
     lines.push(Line::raw("  add /pref URL Label"));
     lines.push(Line::raw("  rm /pref"));
     lines.push(Line::raw("  logmode day|session"));
+    lines.push(Line::raw("  search <term>"));
     lines.push(Line::raw("  saver [cena]"));
+    lines.push(Line::raw("/: search logs  n/N: next/prev"));
     lines.push(Line::raw("q: quit  j: jump to bottom"));
 
     let block = Block::default()
@@ -782,54 +963,152 @@ fn build_tail_rows(lines: &[Line<'static>], viewport: usize, width: usize) -> Ve
     rows
 }
 
+fn build_filtered_rows(
+    lines: &[Line<'static>],
+    match_indices: &[usize],
+    start_match: usize,
+    viewport: usize,
+    width: usize,
+) -> Vec<(usize, Line<'static>)> {
+    let mut rows = Vec::with_capacity(viewport);
+    let mut m = start_match;
+    while m < match_indices.len() && rows.len() < viewport {
+        let line_idx = match_indices[m];
+        for wrapped in wrap_line(&lines[line_idx], width) {
+            if rows.len() >= viewport {
+                break;
+            }
+            rows.push((line_idx, wrapped));
+        }
+        m += 1;
+    }
+    rows
+}
+
+fn build_filtered_tail_rows(
+    lines: &[Line<'static>],
+    match_indices: &[usize],
+    viewport: usize,
+    width: usize,
+) -> Vec<(usize, Line<'static>)> {
+    let mut rows: Vec<(usize, Line<'static>)> = Vec::new();
+    let mut m = match_indices.len();
+    while m > 0 && rows.len() < viewport {
+        m -= 1;
+        let line_idx = match_indices[m];
+        let mut wrapped: Vec<(usize, Line<'static>)> = wrap_line(&lines[line_idx], width)
+            .into_iter()
+            .map(|l| (line_idx, l))
+            .collect();
+        wrapped.extend(rows);
+        rows = wrapped;
+        if rows.len() > viewport {
+            let excess = rows.len() - viewport;
+            rows.drain(0..excess);
+        }
+    }
+    rows
+}
+
 fn draw_log(f: &mut Frame, ui: &mut Ui, area: Rect) {
     ui.log_area = area;
     let viewport = area.height.saturating_sub(2) as usize;
     let width = area.width.saturating_sub(2) as usize;
 
-    // The bottom-most scroll position is the logical index of the first
-    // tail row, which accounts for wrapping — a plain `len - viewport`
-    // would snap into follow mode too early when tail lines wrap.
-    let rows = if ui.follow {
-        build_tail_rows(&ui.lines, viewport, width)
-    } else {
-        let tail = build_tail_rows(&ui.lines, viewport, width);
-        let bottom_start = tail.first().map(|(idx, _)| *idx).unwrap_or(0);
-        if ui.scroll >= bottom_start {
-            ui.follow = true;
-            tail
+    let search_active = ui
+        .search_term
+        .as_ref()
+        .is_some_and(|t| !t.is_empty());
+
+    let rows = if search_active {
+        if ui.search_matches.is_empty() {
+            Vec::new()
+        } else if ui.follow {
+            build_filtered_tail_rows(&ui.lines, &ui.search_matches, viewport, width)
         } else {
-            build_display_rows(&ui.lines, ui.scroll, viewport, width)
+            let scroll_match = ui
+                .search_matches
+                .iter()
+                .position(|&m| m >= ui.scroll)
+                .unwrap_or(0);
+            let scroll_match = scroll_match.min(ui.search_matches.len().saturating_sub(1));
+            let mut r = build_filtered_rows(&ui.lines, &ui.search_matches, scroll_match, viewport, width);
+            if r.is_empty() {
+                r = build_filtered_tail_rows(&ui.lines, &ui.search_matches, viewport, width);
+            }
+            r
+        }
+    } else {
+        // The bottom-most scroll position is the logical index of the first
+        // tail row, which accounts for wrapping — a plain `len - viewport`
+        // would snap into follow mode too early when tail lines wrap.
+        if ui.follow {
+            build_tail_rows(&ui.lines, viewport, width)
+        } else {
+            let tail = build_tail_rows(&ui.lines, viewport, width);
+            let bottom_start = tail.first().map(|(idx, _)| *idx).unwrap_or(0);
+            if ui.scroll >= bottom_start {
+                ui.follow = true;
+                tail
+            } else {
+                build_display_rows(&ui.lines, ui.scroll, viewport, width)
+            }
         }
     };
-    if let Some((idx, _)) = rows.first() {
-        ui.scroll = *idx;
+    if !search_active {
+        if let Some((idx, _)) = rows.first() {
+            ui.scroll = *idx;
+        }
     }
     ui.visible_rows = rows.iter().map(|(idx, _)| *idx).collect();
 
-    let visible: Vec<Line> = rows
-        .into_iter()
-        .map(|(idx, line)| {
-            let selected = ui
-                .selection
-                .is_some_and(|(start, end)| idx >= start && idx <= end);
-            if selected {
-                highlight_line(&line)
-            } else {
-                line
-            }
-        })
-        .collect();
+    let active_match_idx = ui
+        .search_matches
+        .get(ui.search_cursor)
+        .copied();
+    let visible: Vec<Line> = if search_active {
+        rows.into_iter()
+            .map(|(idx, line)| {
+                let is_active = Some(idx) == active_match_idx;
+                if is_active {
+                    highlight_search_line(&line, ui.search_term.as_deref().unwrap(), true)
+                } else {
+                    highlight_search_line(&line, ui.search_term.as_deref().unwrap(), false)
+                }
+            })
+            .collect()
+    } else {
+        rows.into_iter()
+            .map(|(idx, line)| {
+                let selected = ui
+                    .selection
+                    .is_some_and(|(start, end)| idx >= start && idx <= end);
+                if selected {
+                    highlight_line(&line)
+                } else {
+                    line
+                }
+            })
+            .collect()
+    };
 
     let border_color = lerp_color(
         ACCENT_SOFT,
         ACCENT,
         ui.flash as f32 / FLASH_FRAMES as f32,
     );
-    let title = if ui.follow {
-        " logs · following "
+    let title = if search_active {
+        let total = ui.search_matches.len();
+        if ui.follow {
+            format!(" logs · filtered {total} · following ")
+        } else {
+            let cur = ui.search_cursor + 1;
+            format!(" logs · filtered {cur}/{total} ")
+        }
+    } else if ui.follow {
+        " logs · following ".to_string()
     } else {
-        " logs · click or drag to copy "
+        " logs · click or drag to copy ".to_string()
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -870,12 +1149,16 @@ fn draw_command_bar(f: &mut Frame, ui: &Ui, area: Rect) {
                 Span::styled(cursor, Style::default().fg(ACCENT)),
             ])
         }
+        Mode::Search => Line::styled(
+            "ENTER confirm  ESC cancel",
+            Style::default().fg(MUTED),
+        ),
         Mode::View => Line::styled(
             "ENTER  command mode",
             Style::default().fg(MUTED),
         ),
     };
-    let border_color = if ui.mode == Mode::Command {
+    let border_color = if ui.mode == Mode::Command || ui.mode == Mode::Search {
         ACCENT
     } else {
         ACCENT_SOFT
@@ -922,6 +1205,141 @@ fn draw_screensaver(f: &mut Frame, engine: &mut Engine) {
             ));
         }
     }
+}
+
+fn update_search(ui: &mut Ui) {
+    let term = ui.search_term.as_deref().unwrap_or("");
+    if term.is_empty() {
+        ui.search_matches.clear();
+        ui.search_cursor = 0;
+        return;
+    }
+
+    let query_lower = term.to_lowercase();
+    ui.search_matches = ui
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line_to_plain(line).to_lowercase().contains(&query_lower))
+        .map(|(i, _)| i)
+        .collect();
+
+    if !ui.search_matches.is_empty() {
+        if !ui.follow {
+            let viewport_center =
+                ui.scroll + (ui.log_area.height.saturating_sub(2) / 2) as usize;
+            ui.search_cursor = ui
+                .search_matches
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, &idx)| {
+                    if idx > viewport_center {
+                        idx - viewport_center
+                    } else {
+                        viewport_center - idx
+                    }
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            scroll_to_match(ui);
+        } else {
+            ui.search_cursor = ui
+                .search_matches
+                .len()
+                .saturating_sub(1);
+        }
+    } else {
+        ui.search_cursor = 0;
+    }
+}
+
+fn navigate_search(ui: &mut Ui, forward: bool) {
+    if ui.search_matches.is_empty() {
+        return;
+    }
+    let len = ui.search_matches.len();
+    if forward {
+        ui.search_cursor = (ui.search_cursor + 1) % len;
+    } else {
+        ui.search_cursor = (ui.search_cursor + len - 1) % len;
+    }
+    scroll_to_match(ui);
+}
+
+fn scroll_to_match(ui: &mut Ui) {
+    let Some(&line_idx) = ui.search_matches.get(ui.search_cursor) else {
+        return;
+    };
+    let first_visible = ui.visible_rows.first().copied().unwrap_or(0);
+    let last_visible = ui.visible_rows.last().copied().unwrap_or(0);
+    if line_idx >= first_visible && line_idx <= last_visible {
+        return;
+    }
+    let viewport_half = (ui.log_area.height.saturating_sub(2) / 2) as usize;
+    ui.scroll = line_idx.saturating_sub(viewport_half);
+    ui.follow = false;
+}
+
+fn highlight_search_line(line: &Line<'static>, query: &str, is_active: bool) -> Line<'static> {
+    if query.is_empty() {
+        return line.clone();
+    }
+
+    let plain = line_to_plain(line);
+    let query_lower = query.to_lowercase();
+    let plain_lower = plain.to_lowercase();
+
+    let passive_style = Style::default().bg(Color::Rgb(60, 55, 40));
+    let active_style = Style::default()
+        .bg(ACCENT)
+        .add_modifier(Modifier::BOLD);
+    let match_style = if is_active { active_style } else { passive_style };
+
+    let matches: Vec<(usize, usize)> = plain_lower
+        .match_indices(&query_lower)
+        .map(|(s, _)| (s, s + query_lower.len()))
+        .collect();
+
+    if matches.is_empty() {
+        return line.clone();
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut pos: usize = 0;
+
+    for span in &line.spans {
+        let content = span.content.as_ref();
+        let span_start = pos;
+        let span_end = pos + content.len();
+
+        let span_matches: Vec<(usize, usize)> = matches
+            .iter()
+            .filter(|(s, e)| *s < span_end && *e > span_start)
+            .map(|(s, e)| {
+                ((*s).max(span_start) - span_start, (*e).min(span_end) - span_start)
+            })
+            .collect();
+
+        if span_matches.is_empty() {
+            spans.push(span.clone());
+        } else {
+            let mut i = 0;
+            for (m_s, m_e) in &span_matches {
+                if i < *m_s {
+                    spans.push(Span::styled(content[i..*m_s].to_string(), span.style));
+                }
+                spans.push(Span::styled(content[*m_s..*m_e].to_string(), match_style));
+                i = *m_e;
+            }
+            if i < content.len() {
+                spans.push(Span::styled(content[i..].to_string(), span.style));
+            }
+        }
+
+        pos = span_end;
+    }
+
+    Line::from(spans)
 }
 
 #[cfg(test)]
