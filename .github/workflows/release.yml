@@ -31,7 +31,7 @@ jobs:
             targets: x86_64-pc-windows-msvc
             bin: debugproxy.exe
             archive: debugproxy-windows-x86_64
-            rustflags: "-C target-feature=+crt-static -C link-args=resource.res"
+            rustflags: "-C target-feature=+crt-static"
           - os: macos-latest
             # Apple Silicon only — Intel Macs are unsupported.
             targets: aarch64-apple-darwin
@@ -47,27 +47,6 @@ jobs:
           targets: ${{ matrix.targets }}
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Fix Git link.exe shadowing MSVC linker (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          if [ -f "C:/Program Files/Git/usr/bin/link.exe" ]; then
-            mv "C:/Program Files/Git/usr/bin/link.exe" "C:/Program Files/Git/usr/bin/link.exe.bak"
-            echo "Moved Git link.exe out of PATH"
-          fi
-
-      - name: Setup MSVC developer environment (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Compile Windows resource (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          echo '1 ICON "assets/debugproxy.ico"' > resource.rc
-          rc resource.rc
-          echo "Windows resource compiled"
 
       - name: Validate version
         if: startsWith(github.ref, 'refs/tags/v')
