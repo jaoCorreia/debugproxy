@@ -67,7 +67,7 @@ jobs:
         run: |
           echo '1 ICON "assets/debugproxy.ico"' > resource.rc
           rc resource.rc
-          echo "Windows resource compiled successfully"
+          echo "Windows resource compiled"
 
       - name: Validate version
         if: startsWith(github.ref, 'refs/tags/v')
