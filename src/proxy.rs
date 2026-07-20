@@ -270,12 +270,24 @@ async fn api_status(State(state): State<ServerState>) -> Response {
         .iter()
         .map(|r| json!({ "prefix": r.prefix, "target": r.target, "label": r.label }))
         .collect();
+    let packages: Vec<Value> = app
+        .package_states_snapshot()
+        .iter()
+        .map(|(label, info)| {
+            json!({
+                "label": label,
+                "active": info.active_requests,
+                "total": info.total_requests,
+            })
+        })
+        .collect();
     let body = json!({
         "uptime": app.uptime_secs(),
         "port": app.port,
         "logFile": app.logger.get_session_file().map(|p| p.display().to_string()),
         "filters": app.filters.lock().unwrap().as_json(),
         "routes": routes,
+        "packages": packages,
     });
     Response::builder()
         .status(StatusCode::OK)
@@ -397,6 +409,8 @@ async fn proxy_handler(State(state): State<ServerState>, req: Request) -> Respon
         );
     };
 
+    app.package_start(&route.label);
+
     forward_request(&state, req, &route, &id, start).await
 }
 
@@ -513,6 +527,7 @@ async fn forward_request(
                         status_color(status.as_u16()),
                         &route.label,
                     );
+                    app.package_end(&route.label, duration);
 
                     let mut builder = Response::builder().status(status.as_u16());
                     for (name, value) in res_headers.iter() {
@@ -535,6 +550,7 @@ async fn forward_request(
                 }
                 Err(e) => {
                     let duration = start.elapsed().as_millis();
+                    app.package_end(&route.label, duration);
                     app.log(&format!(
                         "  {RED}ERROR:{RESET} {e} {DIM}{duration}ms{RESET}\n"
                     ));
@@ -545,12 +561,14 @@ async fn forward_request(
         Err(e) => {
             let duration = start.elapsed().as_millis();
             if e.is_timeout() {
+                app.package_end(&route.label, duration);
                 app.log(&format!("  {RED}TIMEOUT{RESET} {DIM}{duration}ms{RESET}\n"));
                 json_error(
                     StatusCode::GATEWAY_TIMEOUT,
                     json!({ "error": "Timeout (120s)" }),
                 )
             } else {
+                app.package_end(&route.label, duration);
                 app.log(&format!(
                     "  {RED}ERROR:{RESET} {e} {DIM}{duration}ms{RESET}\n"
                 ));

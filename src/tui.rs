@@ -847,6 +847,32 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &Ui, area: Rect) {
         ]));
     }
 
+    let packages = app.package_states_snapshot();
+    if !packages.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::styled("▸ Packages", heading));
+        let mut sorted: Vec<_> = packages.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (label, info) in &sorted {
+            let marker = if info.active_requests > 0 {
+                Span::styled("◉", Style::default().fg(Color::Rgb(120, 180, 240)))
+            } else {
+                Span::styled("⬢", Style::default().fg(OK))
+            };
+            let detail = if info.active_requests > 0 {
+                format!("{} active", info.active_requests)
+            } else {
+                format!("{} req", info.total_requests)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                marker,
+                Span::styled(format!(" {}", label), Style::default().fg(Color::White)),
+                Span::styled(format!(" ({})", detail), Style::default().fg(MUTED)),
+            ]));
+        }
+    }
+
     lines.push(Line::default());
     lines.push(Line::styled("▸ File", heading));
     lines.push(Line::from(vec![

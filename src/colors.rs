@@ -23,18 +23,7 @@ fn ansi_code(name: &str) -> Option<&'static str> {
 }
 
 fn default_service_colors() -> HashMap<String, String> {
-    [
-        ("Agriculture", "green"),
-        ("Weather", "cyan"),
-        ("Foreca", "yellow"),
-        ("Weather.com", "yellow"),
-        ("Keycloak", "magenta"),
-        ("Identity", "magenta"),
-        ("Images", "dim"),
-    ]
-    .iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect()
+    HashMap::new()
 }
 
 #[derive(Debug, Clone)]

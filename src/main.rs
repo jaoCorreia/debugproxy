@@ -8,6 +8,7 @@ mod screensaver;
 mod state;
 mod tui;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -59,6 +60,7 @@ fn main() {
         config: cfg,
         log_tx: tx,
         request_count: std::sync::atomic::AtomicU64::new(0),
+        package_states: Mutex::new(HashMap::new()),
     });
 
     app.logger.init_session();
