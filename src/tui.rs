@@ -57,15 +57,12 @@ struct Ui {
     tick: u64,
     flash: u8,
     log_area: Rect,
+    sidebar_area: Rect,
+    sidebar_scroll: usize,
+    sidebar_total: usize,
     selection: Option<(usize, usize)>,
-    /// Logical line where the current drag started; kept separate from
-    /// `selection` (which is normalized min/max) so reversing the drag
-    /// direction doesn't lose the original click point.
     drag_anchor: Option<usize>,
     toast: Option<(String, u8)>,
-    /// Logical line index behind each currently rendered row, in order.
-    /// Rebuilt every frame by `draw_log` since a wrapped logical line can
-    /// span more than one row.
     visible_rows: Vec<usize>,
     search_term: Option<String>,
     search_matches: Vec<usize>,
@@ -152,6 +149,9 @@ fn event_loop(
         tick: 0,
         flash: 0,
         log_area: Rect::default(),
+        sidebar_area: Rect::default(),
+        sidebar_scroll: 0,
+        sidebar_total: 0,
         selection: None,
         drag_anchor: None,
         toast: None,
@@ -280,7 +280,32 @@ fn event_loop(
                                 KeyCode::Down => {
                                     ui.scroll += 1;
                                 }
+                                KeyCode::Char(']') => {
+                                    ui.sidebar_scroll += 5;
+                                    let inner_h = ui.sidebar_area.height.saturating_sub(2) as usize;
+                                    if ui.sidebar_scroll + inner_h > ui.sidebar_total && ui.sidebar_total > inner_h {
+                                        ui.sidebar_scroll = ui.sidebar_total.saturating_sub(inner_h);
+                                    }
+                                }
+                                KeyCode::Char('[') => {
+                                    ui.sidebar_scroll = ui.sidebar_scroll.saturating_sub(5);
+                                }
                                 KeyCode::Char('y') => copy_selection(&mut ui),
+                                KeyCode::Char('m') => {
+                                    let was_on = app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed);
+                                    app.monitoring_enabled.store(!was_on, std::sync::atomic::Ordering::Relaxed);
+                                    if was_on {
+                                        app.transfer_tracker.lock().unwrap().transfers.clear();
+                                    }
+                                    app.log(&format!("Monitoring: {}",
+                                        if !was_on { "ON" } else { "OFF" }));
+                                }
+                                KeyCode::Char('u') => {
+                                    let was_on = app.ultra_mode.load(std::sync::atomic::Ordering::Relaxed);
+                                    app.ultra_mode.store(!was_on, std::sync::atomic::Ordering::Relaxed);
+                                    app.log(&format!("Ultra mode: {}",
+                                        if !was_on { "ON" } else { "OFF" }));
+                                }
                                 KeyCode::Char('/') => {
                                     ui.mode = Mode::Search;
                                     ui.input = ui.search_term.clone().unwrap_or_default();
@@ -408,13 +433,32 @@ fn row_to_line_idx(ui: &Ui, mouse_row: u16, snap_to_last: bool) -> Option<usize>
 }
 
 fn handle_mouse(ui: &mut Ui, mouse: MouseEvent) {
+    let sidebar = ui.sidebar_area;
+    let on_sidebar = sidebar.width > 0
+        && sidebar.height > 0
+        && mouse.column >= sidebar.x
+        && mouse.column < sidebar.x + sidebar.width
+        && mouse.row >= sidebar.y
+        && mouse.row < sidebar.y + sidebar.height;
+
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            ui.follow = false;
-            ui.scroll = ui.scroll.saturating_sub(3);
+            if on_sidebar {
+                ui.sidebar_scroll = ui.sidebar_scroll.saturating_sub(3);
+            } else {
+                ui.follow = false;
+                ui.scroll = ui.scroll.saturating_sub(3);
+            }
         }
         MouseEventKind::ScrollDown => {
-            ui.scroll += 3;
+            if on_sidebar {
+                ui.sidebar_scroll += 3;
+                if ui.sidebar_scroll + (ui.sidebar_area.height as usize).saturating_sub(2) > ui.sidebar_total {
+                    ui.sidebar_scroll = ui.sidebar_total.saturating_sub((ui.sidebar_area.height as usize).saturating_sub(2));
+                }
+            } else {
+                ui.scroll += 3;
+            }
         }
         MouseEventKind::Down(_) => {
             let clicked_search = ui.search_term.as_ref().is_some_and(|t| !t.is_empty())
@@ -589,6 +633,27 @@ fn execute_command(app: &Arc<AppState>, ui: &mut Ui, cmd: &str, w: u16, h: u16) 
         ui.search_term = Some(term.clone());
         ui.input = term;
         update_search(ui);
+    } else if action == "monitor" {
+        let was_on = app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        app.monitoring_enabled.store(!was_on, std::sync::atomic::Ordering::Relaxed);
+        app.log(&format!("Monitoring: {}",
+            if !was_on { "ON" } else { "OFF" }));
+    } else if action == "ultra" {
+        if parts.len() >= 2 && parts[1] == "off" {
+            app.ultra_mode.store(false, std::sync::atomic::Ordering::Relaxed);
+            app.ultra_routes.lock().unwrap().clear();
+            app.log("Ultra mode: OFF");
+        } else if parts.len() >= 2 {
+            let routes: std::collections::HashSet<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            app.ultra_routes.lock().unwrap().clone_from(&routes);
+            app.ultra_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+            let list: Vec<String> = routes.iter().cloned().collect();
+            app.log(&format!("Ultra mode: ON [{}]", list.join(", ")));
+        } else {
+            app.ultra_routes.lock().unwrap().clear();
+            app.ultra_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+            app.log("Ultra mode: ON (all routes)");
+        }
     } else {
         app.filters.lock().unwrap().handle_command(cmd);
     }
@@ -623,6 +688,8 @@ fn draw(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui) {
             .split(f.area())
     };
 
+    let ultra_active = app.ultra_mode.load(std::sync::atomic::Ordering::Relaxed);
+
     if has_search {
         draw_titlebar(f, app, ui, outer[0]);
         draw_search_bar(f, ui, outer[1]);
@@ -631,7 +698,11 @@ fn draw(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui) {
             .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
             .split(outer[2]);
         draw_sidebar(f, app, ui, top[0]);
-        draw_log(f, ui, top[1]);
+        if ultra_active {
+            draw_ultra_graph(f, app, ui, top[1]);
+        } else {
+            draw_log(f, ui, top[1]);
+        }
         draw_command_bar(f, ui, outer[3]);
     } else {
         draw_titlebar(f, app, ui, outer[0]);
@@ -640,7 +711,11 @@ fn draw(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui) {
             .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
             .split(outer[1]);
         draw_sidebar(f, app, ui, top[0]);
-        draw_log(f, ui, top[1]);
+        if ultra_active {
+            draw_ultra_graph(f, app, ui, top[1]);
+        } else {
+            draw_log(f, ui, top[1]);
+        }
         draw_command_bar(f, ui, outer[2]);
     }
 }
@@ -791,19 +866,49 @@ fn draw_mascot(lines: &mut Vec<Line<'static>>, inner_width: usize, tick: u64) {
     lines.push(Line::styled(format!(" {bottom_str}"), bottom_style));
 }
 
-fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &Ui, area: Rect) {
+fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui, area: Rect) {
+    ui.sidebar_area = area;
     let routes = get_routes();
-    let filters = app.filters.lock().unwrap();
+    let filters_state = {
+        let filters = app.filters.lock().unwrap();
+        filters.state.clone()
+    };
 
     let heading = Style::default().fg(VIOLET).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(MUTED);
+    let bright = Style::default().fg(Color::White);
     let mut lines: Vec<Line> = Vec::new();
 
-    // Inner width minus borders, padding and the mascot's leading space.
+    let mon_on = app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let ultra_on = app.ultra_mode.load(std::sync::atomic::Ordering::Relaxed);
+
+    // ── Mascot ──
     draw_mascot(&mut lines, (SIDEBAR_WIDTH as usize).saturating_sub(5), ui.tick);
     lines.push(Line::default());
 
+    // ── Status bar ──
+    let mut status_parts: Vec<Span> = vec![
+        Span::styled(" port ", dim),
+        Span::styled(format!("{}", app.port), bright),
+        Span::styled(" │ ", dim),
+    ];
+    if mon_on {
+        status_parts.push(Span::styled("MON ", Style::default().fg(OK).add_modifier(Modifier::BOLD)));
+    } else {
+        status_parts.push(Span::styled("mon ", dim));
+    }
+    status_parts.push(Span::styled("│ ", dim));
+    if ultra_on {
+        status_parts.push(Span::styled("ULTRA", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+    } else {
+        status_parts.push(Span::styled("ultra", dim));
+    }
+    lines.push(Line::from(status_parts));
+    lines.push(Line::default());
+
+    // ── Services ──
     lines.push(Line::styled("▸ Services", heading));
-    for (label, enabled) in &filters.state {
+    for (label, enabled) in &filters_state {
         let alias = if label == LOGS_KEY {
             "l".to_string()
         } else {
@@ -812,99 +917,222 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &Ui, area: Rect) {
                 .find(|r| &r.label == label)
                 .map(|r| r.prefix.trim_start_matches('/').to_string())
                 .unwrap_or_else(|| {
-                    label
-                        .chars()
-                        .next()
-                        .map(|c| c.to_ascii_lowercase().to_string())
-                        .unwrap_or_default()
+                    label.chars().next().map(|c| c.to_ascii_lowercase().to_string()).unwrap_or_default()
                 })
         };
         let marker = if *enabled {
             Span::styled("●", Style::default().fg(OK))
         } else {
-            Span::styled("○", Style::default().fg(MUTED))
+            Span::styled("○", dim)
         };
-        let label_style = if *enabled {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(MUTED)
-        };
+        let label_style = if *enabled { bright } else { dim };
         lines.push(Line::from(vec![
             Span::raw(" "),
             marker,
             Span::styled(format!(" {:<13}", label), label_style),
-            Span::styled(format!("({alias})"), Style::default().fg(MUTED)),
+            Span::styled(format!("({alias})"), dim),
         ]));
     }
 
+    // ── Transfers (if monitoring on) ──
+    lines.push(Line::default());
+    if mon_on {
+        let transfers = {
+            let tracker = app.transfer_tracker.lock().unwrap();
+            tracker.snapshot()
+        };
+        if !transfers.is_empty() {
+            let ultra_routes = app.ultra_routes.lock().unwrap();
+            let active_count = transfers.iter().filter(|t| t.status.is_none()).count();
+            let status_str = if active_count > 0 {
+                format!(" · {} active", active_count)
+            } else {
+                String::new()
+            };
+            lines.push(Line::styled(
+                format!("▸ Transfers{status_str}"),
+                heading,
+            ));
+            let mut shown = 0usize;
+            for t in &transfers {
+                if shown >= 10 || (ultra_on && !ultra_routes.is_empty() && !ultra_routes.contains(&t.route_label)) {
+                    continue;
+                }
+                let method_style = match t.method.as_str() {
+                    "GET" => Style::default().fg(OK),
+                    "POST" => Style::default().fg(Color::Rgb(200, 180, 100)),
+                    "PUT" | "PATCH" => Style::default().fg(Color::Rgb(150, 140, 220)),
+                    "DELETE" => Style::default().fg(Color::Rgb(220, 120, 120)),
+                    _ => bright,
+                };
+                let path_short = if t.path.len() > 16 {
+                    format!("{}…", &t.path[..15])
+                } else {
+                    t.path.clone()
+                };
+                let status_str = match t.status {
+                    None => "⟳ ".to_string(),
+                    Some(s) => format!("{s} "),
+                };
+                let dur_str = t.duration_ms.map(|d| format!("{d}ms")).unwrap_or_default();
+                let size_str = match t.size {
+                    Some(sz) if sz >= 1024 * 1024 => format!("{:.1}M", sz as f64 / 1024.0 / 1024.0),
+                    Some(sz) if sz >= 1024 => format!("{}K", sz / 1024),
+                    Some(sz) => format!("{sz}B"),
+                    None => String::new(),
+                };
+                let trail = if t.status.is_none() {
+                    "…".to_string()
+                } else if size_str.is_empty() {
+                    dur_str
+                } else {
+                    format!("{dur_str} {size_str}")
+                };
+                let s_color = match t.status {
+                    None => ACCENT,
+                    Some(s) if (200..300).contains(&s) => OK,
+                    Some(s) if (400..500).contains(&s) => Color::Rgb(200, 180, 100),
+                    Some(_) => Color::Rgb(220, 100, 100),
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(status_str, Style::default().fg(s_color)),
+                    Span::styled(t.method.clone(), method_style),
+                    Span::raw(" "),
+                    Span::styled(path_short, bright),
+                    Span::styled(format!(" {trail}"), dim),
+                ]));
+                shown += 1;
+            }
+        }
+    } else {
+        lines.push(Line::styled("▸ Transfers", heading));
+        lines.push(Line::styled("  (m) enable monitoring", dim));
+    }
+
+    // ── Routes ──
     lines.push(Line::default());
     lines.push(Line::styled("▸ Routes", heading));
-    for r in &routes {
-        lines.push(Line::from(vec![
-            Span::styled(r.prefix.clone(), Style::default().fg(ACCENT)),
-            Span::styled(" → ", Style::default().fg(MUTED)),
-            Span::styled(r.label.clone(), Style::default().fg(Color::White)),
-        ]));
-    }
-
-    let packages = app.package_states_snapshot();
-    if !packages.is_empty() {
-        lines.push(Line::default());
-        lines.push(Line::styled("▸ Packages", heading));
-        let mut sorted: Vec<_> = packages.iter().collect();
-        sorted.sort_by(|a, b| a.0.cmp(b.0));
-        for (label, info) in &sorted {
-            let marker = if info.active_requests > 0 {
-                Span::styled("◉", Style::default().fg(Color::Rgb(120, 180, 240)))
-            } else {
-                Span::styled("⬢", Style::default().fg(OK))
-            };
-            let detail = if info.active_requests > 0 {
-                format!("{} active", info.active_requests)
-            } else {
-                format!("{} req", info.total_requests)
-            };
+    if routes.is_empty() {
+        lines.push(Line::styled("  add /pref URL Label", dim));
+    } else {
+        for r in &routes {
             lines.push(Line::from(vec![
-                Span::raw(" "),
-                marker,
-                Span::styled(format!(" {}", label), Style::default().fg(Color::White)),
-                Span::styled(format!(" ({})", detail), Style::default().fg(MUTED)),
+                Span::styled(format!("  {}", r.prefix), Style::default().fg(ACCENT)),
+                Span::styled(" → ", dim),
+                Span::styled(r.label.clone(), bright),
             ]));
         }
     }
 
+    // ── Commands ──
     lines.push(Line::default());
-    lines.push(Line::styled("▸ File", heading));
+    lines.push(Line::styled("▸ Commands", heading));
     lines.push(Line::from(vec![
-        Span::styled("Mode: ", Style::default().fg(MUTED)),
-        Span::styled(app.logger.get_mode(), Style::default().fg(Color::White)),
+        Span::styled("  m ", Style::default().fg(ACCENT)),
+        Span::styled("monitor | ", dim),
+        Span::styled("u ", Style::default().fg(ACCENT)),
+        Span::styled("ultra mode", dim),
     ]));
-    let session_file = app
-        .logger
-        .get_session_file()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "(aguardando...)".to_string());
-    lines.push(Line::styled(session_file, Style::default().fg(MUTED)));
-
+    lines.push(Line::from(vec![
+        Span::styled("  [/] ", Style::default().fg(ACCENT)),
+        Span::styled("scroll sidebar", dim),
+    ]));
+    lines.push(Line::styled("  ENTER  command bar", dim));
+    lines.push(Line::from(vec![
+        Span::styled("  ", dim),
+        Span::styled("add /p URL Label", bright),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  ", dim),
+        Span::styled("rm /p", bright),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  ", dim),
+        Span::styled("monitor | ultra [rotas]|off", bright),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  ", dim),
+        Span::styled("logmode day|session", bright),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  ", dim),
+        Span::styled("search <term>", bright),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  ", dim),
+        Span::styled("all | none | saver", bright),
+    ]));
     lines.push(Line::default());
-    lines.push(Line::styled("▸ Keys", heading));
-    lines.push(Line::raw("keys: toggle service"));
-    lines.push(Line::raw("ENTER: command mode"));
-    lines.push(Line::raw("  all, none, status"));
-    lines.push(Line::raw("  add /pref URL Label"));
-    lines.push(Line::raw("  rm /pref"));
-    lines.push(Line::raw("  logmode day|session"));
-    lines.push(Line::raw("  search <term>"));
-    lines.push(Line::raw("  saver [cena]"));
-    lines.push(Line::raw("/: search logs  n/N: next/prev"));
-    lines.push(Line::raw("q: quit  j: jump to bottom"));
+    lines.push(Line::from(vec![
+        Span::styled("  / ", Style::default().fg(ACCENT)),
+        Span::styled("search | ", dim),
+        Span::styled("n/N ", Style::default().fg(ACCENT)),
+        Span::styled("next/prev", dim),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  q ", Style::default().fg(ACCENT)),
+        Span::styled("quit | ", dim),
+        Span::styled("j ", Style::default().fg(ACCENT)),
+        Span::styled("jump bottom", dim),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  y ", Style::default().fg(ACCENT)),
+        Span::styled("copy selection", dim),
+    ]));
+
+    // ── File ──
+    lines.push(Line::default());
+    lines.push(Line::styled("▸ Log", heading));
+    lines.push(Line::from(vec![
+        Span::styled(app.logger.get_mode(), bright),
+        Span::styled("  ↑", dim),
+        Span::styled(format!("{}s", app.uptime_secs()), bright),
+    ]));
+    if let Some(p) = app.logger.get_session_file() {
+        lines.push(Line::styled(p.display().to_string(), dim));
+    }
+
+    // ── Scroll clipping ──
+    ui.sidebar_total = lines.len();
+    let inner_h = area.height.saturating_sub(2) as usize;
+    if ui.sidebar_scroll + inner_h > ui.sidebar_total && ui.sidebar_total > inner_h {
+        ui.sidebar_scroll = ui.sidebar_total.saturating_sub(inner_h);
+    }
+    let visible: Vec<Line> = if lines.len() <= inner_h {
+        ui.sidebar_scroll = 0;
+        lines
+    } else {
+        let end = (ui.sidebar_scroll + inner_h).min(lines.len());
+        lines[ui.sidebar_scroll..end].to_vec()
+    };
+
+    let scroll_pct = if ui.sidebar_total > inner_h {
+        (ui.sidebar_scroll as f64 / (ui.sidebar_total - inner_h) as f64 * 100.0) as u8
+    } else {
+        0u8
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT_SOFT))
-        .padding(Padding::horizontal(1));
-    f.render_widget(Paragraph::new(lines).block(block), area);
+        .padding(Padding::horizontal(1))
+        .title_bottom(Span::styled(
+            if scroll_pct == 0 && ui.sidebar_total == 0 {
+                String::new()
+            } else if ui.sidebar_total <= inner_h {
+                String::new()
+            } else if scroll_pct == 0 {
+                " ▾ ".to_string()
+            } else if scroll_pct >= 100 {
+                " ▴ ".to_string()
+            } else {
+                format!(" {scroll_pct}% ")
+            },
+            dim,
+        ));
+    f.render_widget(Paragraph::new(Text::from(visible)).block(block), area);
 }
 
 fn lerp_color(from: Color, to: Color, t: f32) -> Color {
@@ -1155,6 +1383,132 @@ fn draw_log(f: &mut Frame, ui: &mut Ui, area: Rect) {
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(title, Style::default().fg(MUTED)));
     f.render_widget(Paragraph::new(Text::from(visible)).block(block), area);
+}
+
+fn draw_ultra_graph(f: &mut Frame, app: &Arc<AppState>, _ui: &Ui, area: Rect) {
+    let tracker = app.transfer_tracker.lock().unwrap();
+    let transfers = tracker.snapshot();
+    drop(tracker);
+
+    let now_ms = app.uptime_millis();
+    let window_ms: u64 = 15_000;
+    let viewport_w = area.width.saturating_sub(2) as usize;
+    let viewport_h = area.height.saturating_sub(2) as usize;
+    if viewport_w < 10 || viewport_h == 0 {
+        return;
+    }
+
+    let filtered: Vec<_> = {
+        let ultra_routes = app.ultra_routes.lock().unwrap();
+        transfers
+            .iter()
+            .filter(|t| {
+                ultra_routes.is_empty() || ultra_routes.contains(&t.route_label)
+            })
+            .collect()
+    };
+
+    let mut rows: Vec<Line<'static>> = vec![
+        Line::styled(
+            format!(" Timeline · {:>5}ms ───────────────────────────────────── 0ms", window_ms),
+            Style::default().fg(MUTED),
+        ),
+    ];
+
+    if filtered.is_empty() {
+        let mon_on = app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        rows.push(Line::styled(
+            if mon_on {
+                "  waiting for traffic…"
+            } else {
+                "  enable monitoring (m)"
+            },
+            Style::default().fg(MUTED),
+        ));
+    }
+
+    for t in filtered.iter().rev().take(viewport_h.saturating_sub(1)) {
+        let elapsed = now_ms.saturating_sub(t.start_ms);
+        if elapsed > window_ms + (t.duration_ms.unwrap_or(0) as u64) {
+            continue;
+        }
+
+        let status_color = match t.status {
+            Some(s) if (200..300).contains(&s) => OK,
+            Some(s) if (400..500).contains(&s) => Color::Rgb(200, 180, 100),
+            Some(_) => Color::Rgb(220, 100, 100),
+            None => ACCENT,
+        };
+        let status_str = match t.status {
+            None => " ⟳ ".to_string(),
+            Some(s) => format!("{s}"),
+        };
+
+        let bar_start_f = elapsed.min(window_ms) as f64;
+        let bar_x = (viewport_w as f64 * (1.0 - bar_start_f / window_ms as f64)) as usize;
+        let bar_x = bar_x.min(viewport_w.saturating_sub(1));
+
+        let bar_dur = t.duration_ms.unwrap_or(0).min(window_ms as u128) as f64;
+        let bar_w = (viewport_w as f64 * bar_dur / window_ms as f64) as usize;
+        let bar_w = bar_w.max(1).min(viewport_w.saturating_sub(bar_x));
+
+        let label = match t.path.len() {
+            0..=22 => t.path.clone(),
+            _ => format!("{}…", &t.path[..21]),
+        };
+        let dur_str = t.duration_ms.map(|d| format!("{d}ms")).unwrap_or_default();
+        let size_str = match t.size {
+            Some(sz) if sz >= 1024 * 1024 => format!("{:.1}MB", sz as f64 / 1024.0 / 1024.0),
+            Some(sz) if sz >= 1024 => format!("{}KB", sz / 1024),
+            Some(sz) => format!("{sz}B"),
+            None => String::new(),
+        };
+        let info = if size_str.is_empty() {
+            dur_str
+        } else {
+            format!("{dur_str} {size_str}")
+        };
+
+        let mut chars: Vec<char> = vec![' '; viewport_w];
+        for i in bar_x..(bar_x + bar_w).min(viewport_w) {
+            chars[i] = '█';
+        }
+        let row_str: String = chars.into_iter().collect();
+
+        rows.push(Line::from(vec![
+            Span::styled(
+                format!("{status_str:>3} "),
+                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:>3} ", t.method),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                if t.status.is_none() { row_str.clone() } else { String::new() },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                if t.status.is_some() { row_str } else { String::new() },
+                Style::default().bg(status_color).fg(Color::Black),
+            ),
+            Span::styled(
+                format!(" {}", label),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                if info.is_empty() { String::new() } else { format!("  {info}") },
+                Style::default().fg(MUTED),
+            ),
+        ]));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT_SOFT))
+        .title(Span::styled(" ultra · timeline ", Style::default().fg(ACCENT)));
+    f.render_widget(Paragraph::new(Text::from(rows)).block(block), area);
 }
 
 fn draw_command_bar(f: &mut Frame, ui: &Ui, area: Rect) {

@@ -270,14 +270,21 @@ async fn api_status(State(state): State<ServerState>) -> Response {
         .iter()
         .map(|r| json!({ "prefix": r.prefix, "target": r.target, "label": r.label }))
         .collect();
-    let packages: Vec<Value> = app
-        .package_states_snapshot()
+    let transfers: Vec<Value> = app
+        .transfer_tracker
+        .lock()
+        .unwrap()
+        .snapshot()
         .iter()
-        .map(|(label, info)| {
+        .map(|t| {
             json!({
-                "label": label,
-                "active": info.active_requests,
-                "total": info.total_requests,
+                "id": t.id,
+                "method": t.method,
+                "path": t.path,
+                "route_label": t.route_label,
+                "status": t.status.unwrap_or(0),
+                "duration_ms": t.duration_ms,
+                "size": t.size,
             })
         })
         .collect();
@@ -287,7 +294,7 @@ async fn api_status(State(state): State<ServerState>) -> Response {
         "logFile": app.logger.get_session_file().map(|p| p.display().to_string()),
         "filters": app.filters.lock().unwrap().as_json(),
         "routes": routes,
-        "packages": packages,
+        "transfers": transfers,
     });
     Response::builder()
         .status(StatusCode::OK)
@@ -374,6 +381,39 @@ async fn api_cmd(State(state): State<ServerState>, body: axum::body::Bytes) -> R
         );
     }
 
+    if action == "monitor" {
+        let was_on = app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        app.monitoring_enabled.store(!was_on, std::sync::atomic::Ordering::Relaxed);
+        if !was_on {
+            app.log("\x1b[32mMonitoring ON\x1b[0m");
+        } else {
+            app.log("\x1b[2mMonitoring OFF\x1b[0m");
+            app.transfer_tracker.lock().unwrap().transfers.clear();
+        }
+        return json_error(StatusCode::OK, json!({ "ok": true, "monitoring": !was_on }));
+    }
+
+    if action == "ultra" {
+        if parts.len() >= 2 && parts[1] == "off" {
+            app.ultra_mode.store(false, std::sync::atomic::Ordering::Relaxed);
+            app.ultra_routes.lock().unwrap().clear();
+            app.log("\x1b[2mUltra mode OFF\x1b[0m");
+            return json_error(StatusCode::OK, json!({ "ok": true, "ultra": false }));
+        }
+        let routes: std::collections::HashSet<String> = if parts.len() >= 2 {
+            parts[1..].iter().map(|s| s.to_string()).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        app.ultra_routes.lock().unwrap().clone_from(&routes);
+        app.ultra_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+        let list: Vec<_> = routes.iter().collect();
+        app.log(&format!("\x1b[36mUltra mode ON{}\x1b[0m",
+            if list.is_empty() { String::new() } else { format!(" [{}]", list.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")) }
+        ));
+        return json_error(StatusCode::OK, json!({ "ok": true, "ultra": true, "routes": list }));
+    }
+
     app.filters.lock().unwrap().handle_command(cmd);
     let filters = app.filters.lock().unwrap().as_json();
     json_error(StatusCode::OK, json!({ "ok": true, "cmd": cmd, "filters": filters }))
@@ -392,6 +432,7 @@ async fn proxy_handler(State(state): State<ServerState>, req: Request) -> Respon
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
     let full_url = format!("{path}{query}");
+    let method_str = req.method().to_string();
 
     let Some(route) = find_route(&path) else {
         let ts = timestamp();
@@ -409,7 +450,28 @@ async fn proxy_handler(State(state): State<ServerState>, req: Request) -> Respon
         );
     };
 
-    app.package_start(&route.label);
+    let route_color = app.colors.get(&route.label);
+    let now_ms = app.uptime_millis();
+
+    if app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        app.transfer_tracker.lock().unwrap().start_transfer(
+            &id,
+            &method_str,
+            &full_url,
+            &route.label,
+            now_ms,
+        );
+    }
+    if app.filters.lock().unwrap().should_show(&route.label) {
+        app.log(&format!(
+            "{DIM}[{}]{RESET} {BOLD}{}{RESET} {}{} {}{RESET}",
+            timestamp(),
+            id,
+            route_color,
+            method_str,
+            full_url,
+        ));
+    }
 
     forward_request(&state, req, &route, &id, start).await
 }
@@ -518,16 +580,24 @@ async fn forward_request(
             match read_body_capped(proxy_res, MAX_BUFFERED_RES_BYTES).await {
                 Ok(res_body) => {
                     let duration = start.elapsed().as_millis();
+                    let route_color = status_color(status.as_u16());
                     log_response(
                         app,
                         status.as_u16(),
                         &res_body,
                         &res_content_type,
                         duration,
-                        status_color(status.as_u16()),
+                        route_color,
                         &route.label,
                     );
-                    app.package_end(&route.label, duration);
+                    if app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                        app.transfer_tracker.lock().unwrap().end_transfer(
+                            id,
+                            status.as_u16(),
+                            duration,
+                            Some(res_body.len()),
+                        );
+                    }
 
                     let mut builder = Response::builder().status(status.as_u16());
                     for (name, value) in res_headers.iter() {
@@ -550,7 +620,11 @@ async fn forward_request(
                 }
                 Err(e) => {
                     let duration = start.elapsed().as_millis();
-                    app.package_end(&route.label, duration);
+                    if app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                        app.transfer_tracker.lock().unwrap().end_transfer(
+                            id, 0, duration, None,
+                        );
+                    }
                     app.log(&format!(
                         "  {RED}ERROR:{RESET} {e} {DIM}{duration}ms{RESET}\n"
                     ));
@@ -561,14 +635,22 @@ async fn forward_request(
         Err(e) => {
             let duration = start.elapsed().as_millis();
             if e.is_timeout() {
-                app.package_end(&route.label, duration);
+                if app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    app.transfer_tracker.lock().unwrap().end_transfer(
+                        id, 0, duration, None,
+                    );
+                }
                 app.log(&format!("  {RED}TIMEOUT{RESET} {DIM}{duration}ms{RESET}\n"));
                 json_error(
                     StatusCode::GATEWAY_TIMEOUT,
                     json!({ "error": "Timeout (120s)" }),
                 )
             } else {
-                app.package_end(&route.label, duration);
+                if app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    app.transfer_tracker.lock().unwrap().end_transfer(
+                        id, 0, duration, None,
+                    );
+                }
                 app.log(&format!(
                     "  {RED}ERROR:{RESET} {e} {DIM}{duration}ms{RESET}\n"
                 ));

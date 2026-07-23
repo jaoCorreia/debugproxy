@@ -8,14 +8,14 @@ mod screensaver;
 mod state;
 mod tui;
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use colors::ServiceColors;
 use filters::Filters;
 use logger::FileLogger;
-use state::AppState;
+use state::{AppState, TransferTracker};
 
 fn pause_on_exit() {
     #[cfg(target_os = "windows")]
@@ -60,7 +60,10 @@ fn main() {
         config: cfg,
         log_tx: tx,
         request_count: std::sync::atomic::AtomicU64::new(0),
-        package_states: Mutex::new(HashMap::new()),
+        transfer_tracker: Mutex::new(TransferTracker::new(200)),
+        monitoring_enabled: std::sync::atomic::AtomicBool::new(false),
+        ultra_mode: std::sync::atomic::AtomicBool::new(false),
+        ultra_routes: Mutex::new(HashSet::new()),
     });
 
     app.logger.init_session();
