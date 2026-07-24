@@ -60,7 +60,7 @@ impl AiClient {
     }
 
     pub fn model(&self) -> &str {
-        self.config.model.as_deref().unwrap_or("deepseek-chat")
+        self.config.model.as_deref().unwrap_or("deepseek-v4-flash")
     }
 
     pub fn max_context_lines(&self) -> usize {

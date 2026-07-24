@@ -67,7 +67,7 @@ fn main() {
             eprintln!("AI: no API key found (set DEEPSEEK_API_KEY or AI_API_KEY). AI features disabled.");
             None
         } else {
-            eprintln!("AI: enabled ({})", ai_cfg.model.as_deref().unwrap_or("deepseek-chat"));
+            eprintln!("AI: enabled ({})", ai_cfg.model.as_deref().unwrap_or("deepseek-v4-flash"));
             Some(AiClient::new(ai_cfg, api_key))
         }
     } else {
