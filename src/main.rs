@@ -1,6 +1,7 @@
 mod ai;
 mod colors;
 mod config;
+mod logcat;
 mod filters;
 mod logger;
 mod proxy;
@@ -17,6 +18,7 @@ use ai::AiClient;
 use colors::ServiceColors;
 use filters::Filters;
 use logger::FileLogger;
+use logcat::LogcatState;
 use state::{AppState, RateLimiter, TransferTracker};
 
 fn pause_on_exit() {
@@ -74,6 +76,8 @@ fn main() {
         None
     };
 
+    let logcat_filter = cfg.logcat.as_ref().map(|c| c.default_filter()).unwrap_or_else(|| "*:W".to_string());
+
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     let app = Arc::new(AppState {
@@ -93,6 +97,7 @@ fn main() {
         ai_api_token: std::env::var("AI_API_TOKEN").ok().filter(|v| !v.is_empty()),
         rt: rt.handle().clone(),
         ai_rate_limiter: RateLimiter::new(10),
+        logcat_state: LogcatState::new(&logcat_filter),
     });
 
     app.logger.init_session();

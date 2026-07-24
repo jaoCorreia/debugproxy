@@ -22,9 +22,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use unicode_width::UnicodeWidthChar;
 
 use crate::colors::{GREEN, RED, RESET, YELLOW};
-use crate::filters::LOGS_KEY;
+use crate::filters::{LOGCAT_KEY, LOGS_KEY};
 use crate::routes::{add_route, get_routes, remove_route};
 use crate::screensaver::{Engine, SCENE_NAMES};
+use crate::logcat::{logcat_status, spawn_logcat, stop_logcat};
 use crate::state::AppState;
 
 const SIDEBAR_WIDTH: u16 = 30;
@@ -681,6 +682,21 @@ fn execute_command(app: &Arc<AppState>, ui: &mut Ui, cmd: &str, w: u16, h: u16) 
         forward_ai_observation(app, &message, &urgency);
     } else if action == "report" {
         report_ai(app);
+    } else if action == "logcat" {
+        if parts.len() < 2 {
+            let s = logcat_status(app);
+            app.log(&s);
+        } else {
+            match parts[1] {
+                "start" => spawn_logcat(app.clone(), parts.get(2).unwrap_or(&"")),
+                "stop" => stop_logcat(app),
+                "status" => {
+                    let s = logcat_status(app);
+                    app.log(&s);
+                }
+                _ => app.log(&format!("{YELLOW}Use: logcat start|stop|status [filter]{RESET}")),
+            }
+        }
     } else {
         app.filters.lock().unwrap().handle_command(cmd);
     }
@@ -1168,6 +1184,13 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui, area: Rect) {
     } else {
         status_parts.push(Span::styled("ultra", dim));
     }
+    let logcat_on = app.logcat_state.is_running();
+    status_parts.push(Span::styled("│ ", dim));
+    if logcat_on {
+        status_parts.push(Span::styled("ADB", Style::default().fg(OK).add_modifier(Modifier::BOLD)));
+    } else {
+        status_parts.push(Span::styled("adb", dim));
+    }
     lines.push(Line::from(status_parts));
     lines.push(Line::default());
 
@@ -1176,6 +1199,8 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui, area: Rect) {
     for (label, enabled) in &filters_state {
         let alias = if label == LOGS_KEY {
             "l".to_string()
+        } else if label == LOGCAT_KEY {
+            "d".to_string()
         } else {
             routes
                 .iter()
@@ -1349,6 +1374,8 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui, area: Rect) {
         Span::styled("quit | ", dim),
         Span::styled("j ", Style::default().fg(ACCENT)),
         Span::styled("jump bottom", dim),
+        Span::styled("  ", dim),
+        Span::styled("d  toggle logcat", dim),
     ]));
     lines.push(Line::from(vec![
         Span::styled("  a ", Style::default().fg(ACCENT)),

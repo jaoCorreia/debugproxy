@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
+use crate::logcat::ANDROID_KEY;
 use crate::routes::get_routes;
 
 pub const LOGS_KEY: &str = "Logs";
+pub const LOGCAT_KEY: &str = "Android";
 
 #[derive(Debug, Default)]
 pub struct Filters {
@@ -33,6 +35,10 @@ impl Filters {
             LOGS_KEY.to_string(),
             *prev.get(LOGS_KEY).unwrap_or(&true),
         ));
+        state.push((
+            LOGCAT_KEY.to_string(),
+            *prev.get(LOGCAT_KEY).unwrap_or(&false),
+        ));
 
         let mut aliases: HashMap<String, String> = HashMap::new();
         for r in &routes {
@@ -40,9 +46,11 @@ impl Filters {
             aliases.insert(short, r.label.clone());
         }
         aliases.insert("l".to_string(), LOGS_KEY.to_string());
+        aliases.insert("d".to_string(), LOGCAT_KEY.to_string());
 
         let mut all_labels: Vec<String> = vec![LOGS_KEY.to_string()];
         all_labels.extend(labels);
+        all_labels.push(LOGCAT_KEY.to_string());
 
         let mut counts: HashMap<char, usize> = HashMap::new();
         for l in &all_labels {
@@ -70,7 +78,13 @@ impl Filters {
         if route_label.is_empty() {
             return true;
         }
-        let key = if route_label == "LOG" { LOGS_KEY } else { route_label };
+        let key = if route_label == "LOG" {
+            LOGS_KEY
+        } else if route_label == "ANDROID" || route_label == ANDROID_KEY {
+            LOGCAT_KEY
+        } else {
+            route_label
+        };
         self.state
             .iter()
             .find(|(k, _)| k == key)

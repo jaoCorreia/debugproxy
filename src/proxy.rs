@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::colors::{status_color, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use crate::routes::{add_route, find_route, get_routes, remove_route, Route};
+use crate::logcat::{logcat_status, spawn_logcat, stop_logcat};
 use crate::state::AppState;
 
 const MAX_LOGGED_BODY_CHARS: usize = 1000;
@@ -51,6 +52,9 @@ pub async fn run(app: Arc<AppState>) {
         .route("/api/ai/status", get(api_ai_status))
         .route("/api/ai/forward", post(api_ai_forward))
         .route("/api/ai/report", post(api_ai_report_handler))
+        .route("/api/logcat/status", get(api_logcat_status))
+        .route("/api/logcat/start", post(api_logcat_start))
+        .route("/api/logcat/stop", post(api_logcat_stop))
         .fallback(any(proxy_handler))
         .with_state(state);
 
@@ -67,7 +71,7 @@ pub async fn run(app: Arc<AppState>) {
     }
 }
 
-fn timestamp() -> String {
+pub fn timestamp() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
@@ -734,6 +738,39 @@ fn execute_ai_tool(app: &AppState, tc: &crate::ai::ToolCall) {
             app.log(&format!("\x1b[33mAI sugeriu ação desconhecida: {}\x1b[0m", tc.name));
         }
     }
+}
+
+
+
+async fn api_logcat_status(State(state): State<ServerState>) -> Response {
+    let app = &state.app;
+    let s = logcat_status(app);
+    json_error(StatusCode::OK, json!({
+        "running": app.logcat_state.is_running(),
+        "filter": app.logcat_state.filter.lock().unwrap().clone(),
+        "linesCaptured": app.logcat_state.line_count(),
+        "status": s,
+    }))
+}
+
+async fn api_logcat_start(
+    State(state): State<ServerState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let app = &state.app;
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, json!({ "error": "Invalid JSON body" })),
+    };
+    let filter = parsed.get("filter").and_then(|f| f.as_str()).unwrap_or("");
+    spawn_logcat(app.clone(), filter);
+    json_error(StatusCode::OK, json!({ "ok": true }))
+}
+
+async fn api_logcat_stop(State(state): State<ServerState>) -> Response {
+    let app = &state.app;
+    stop_logcat(app);
+    json_error(StatusCode::OK, json!({ "ok": true }))
 }
 
 async fn proxy_handler(State(state): State<ServerState>, req: Request) -> Response {

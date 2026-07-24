@@ -8,6 +8,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::ai::AiClient;
+use crate::logcat::LogcatState;
 use crate::colors::{strip_ansi, ServiceColors};
 use crate::config::Config;
 use crate::filters::Filters;
@@ -134,6 +135,7 @@ pub struct AppState {
     pub ai_api_token: Option<String>,
     pub rt: Handle,
     pub ai_rate_limiter: RateLimiter,
+    pub logcat_state: LogcatState,
 }
 
 impl AppState {
@@ -148,6 +150,10 @@ impl AppState {
 
     pub fn request_total(&self) -> u64 {
         self.request_count.load(Ordering::Relaxed)
+    }
+
+    pub fn log_file_only(&self, text: &str) {
+        self.logger.append(&strip_ansi(text));
     }
 
     pub fn log_multiline(&self, text: &str) {

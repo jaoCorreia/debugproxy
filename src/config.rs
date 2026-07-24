@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::ai::AiConfig;
+use crate::logcat::LogcatConfig;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -28,6 +29,7 @@ pub struct Config {
     pub colors: HashMap<String, String>,
     pub screensaver: Option<ScreensaverConfig>,
     pub ai: Option<AiConfig>,
+    pub logcat: Option<LogcatConfig>,
 }
 
 pub fn base_dir() -> PathBuf {
