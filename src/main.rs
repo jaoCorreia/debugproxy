@@ -17,7 +17,7 @@ use ai::AiClient;
 use colors::ServiceColors;
 use filters::Filters;
 use logger::FileLogger;
-use state::{AppState, TransferTracker};
+use state::{AppState, RateLimiter, TransferTracker};
 
 fn pause_on_exit() {
     #[cfg(target_os = "windows")]
@@ -90,7 +90,9 @@ fn main() {
         ultra_mode: std::sync::atomic::AtomicBool::new(false),
         ultra_routes: Mutex::new(HashSet::new()),
         ai_client,
+        ai_api_token: std::env::var("AI_API_TOKEN").ok().filter(|v| !v.is_empty()),
         rt: rt.handle().clone(),
+        ai_rate_limiter: RateLimiter::new(10),
     });
 
     app.logger.init_session();

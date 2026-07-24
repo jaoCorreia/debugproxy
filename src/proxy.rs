@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use std::net::SocketAddr;
 use base64::Engine;
 use rand::Rng;
 use regex::Regex;
@@ -61,7 +62,7 @@ pub async fn run(app: Arc<AppState>) {
             return;
         }
     };
-    if let Err(e) = axum::serve(listener, router).await {
+    if let Err(e) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
         app.log(&format!("{RED}Server error: {e}{RESET}"));
     }
 }
@@ -242,6 +243,54 @@ fn log_response(
         app.log_multiline(&format!("  {formatted}"));
     }
     app.log("");
+}
+
+
+
+/// Checks AI endpoint access: token bearer auth or localhost-only.
+/// Returns Ok(()) if allowed, Err(StatusCode) if denied.
+fn check_ai_access(
+    headers: &HeaderMap,
+    ai_api_token: &Option<String>,
+    remote_addr: Option<&str>,
+) -> Result<(), StatusCode> {
+    if let Some(expected_token) = ai_api_token {
+        // Token mode: require Bearer token
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if auth.starts_with("Bearer ") && auth[7..] == *expected_token {
+            Ok(())
+        } else {
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    } else {
+        // No token configured: localhost only
+        match remote_addr {
+            Some(addr) => {
+                if addr.starts_with("127.") || addr.starts_with("::1") || addr == "localhost" {
+                    Ok(())
+                } else {
+                    Err(StatusCode::FORBIDDEN)
+                }
+            }
+            None => Ok(()), // If we can't determine, allow (local TUI access)
+        }
+    }
+}
+
+/// Checks rate limit for AI endpoints. Returns Ok(()) if allowed, Err(429) if exceeded.
+fn check_ai_rate_limit(
+    state: &AppState,
+    remote_addr: Option<&str>,
+) -> Result<(), StatusCode> {
+    let key = remote_addr.unwrap_or("unknown");
+    if state.ai_rate_limiter.check(key) {
+        Ok(())
+    } else {
+        Err(StatusCode::TOO_MANY_REQUESTS)
+    }
 }
 
 fn json_error(status: StatusCode, value: Value) -> Response {
@@ -446,8 +495,20 @@ async fn api_ai_status(State(state): State<ServerState>) -> Response {
         .unwrap()
 }
 
-async fn api_ai_ask(State(state): State<ServerState>, body: axum::body::Bytes) -> Response {
+async fn api_ai_ask(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     let app = &state.app;
+    let remote = addr.to_string();
+    if let Err(status) = check_ai_access(&headers, &app.ai_api_token, Some(&remote)) {
+        return json_error(status, json!({ "error": "Access denied" }));
+    }
+    if let Err(status) = check_ai_rate_limit(app, Some(&remote)) {
+        return json_error(status, json!({ "error": "Rate limit exceeded (10 req/min)" }));
+    }
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, json!({ "error": "Invalid JSON body" })),
@@ -496,8 +557,20 @@ async fn api_ai_ask(State(state): State<ServerState>, body: axum::body::Bytes) -
     }
 }
 
-async fn api_ai_forward(State(state): State<ServerState>, body: axum::body::Bytes) -> Response {
+async fn api_ai_forward(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     let app = &state.app;
+    let remote = addr.to_string();
+    if let Err(status) = check_ai_access(&headers, &app.ai_api_token, Some(&remote)) {
+        return json_error(status, json!({ "error": "Access denied" }));
+    }
+    if let Err(status) = check_ai_rate_limit(app, Some(&remote)) {
+        return json_error(status, json!({ "error": "Rate limit exceeded (10 req/min)" }));
+    }
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, json!({ "error": "Invalid JSON body" })),
@@ -563,8 +636,20 @@ fn build_report_context(app: &crate::state::AppState) -> String {
     report
 }
 
-async fn api_ai_report_handler(State(state): State<ServerState>, body: axum::body::Bytes) -> Response {
+async fn api_ai_report_handler(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     let app = &state.app;
+    let remote = addr.to_string();
+    if let Err(status) = check_ai_access(&headers, &app.ai_api_token, Some(&remote)) {
+        return json_error(status, json!({ "error": "Access denied" }));
+    }
+    if let Err(status) = check_ai_rate_limit(app, Some(&remote)) {
+        return json_error(status, json!({ "error": "Rate limit exceeded (10 req/min)" }));
+    }
     let Some(ai) = &app.ai_client else {
         return json_error(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "AI not configured" }));
     };

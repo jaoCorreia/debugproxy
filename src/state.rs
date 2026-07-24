@@ -1,7 +1,8 @@
 use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedSender;
@@ -82,6 +83,40 @@ impl TransferTracker {
     }
 }
 
+/// Simple rate limiter: max N requests per window per client key (IP).
+pub struct RateLimiter {
+    max_per_minute: usize,
+    hits: Mutex<HashMap<String, Vec<u64>>>,
+}
+
+impl RateLimiter {
+    pub fn new(max_per_minute: usize) -> Self {
+        Self {
+            max_per_minute,
+            hits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns true if the request is allowed, false if rate limited.
+    pub fn check(&self, client_key: &str) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let window_start = now.saturating_sub(60);
+
+        let mut hits = self.hits.lock().unwrap();
+        let timestamps = hits.entry(client_key.to_string()).or_default();
+        // Remove expired entries
+        timestamps.retain(|&t| t > window_start);
+        if timestamps.len() >= self.max_per_minute {
+            return false;
+        }
+        timestamps.push(now);
+        true
+    }
+}
+
 pub struct AppState {
     pub port: u16,
     pub start: Instant,
@@ -96,7 +131,9 @@ pub struct AppState {
     pub ultra_mode: AtomicBool,
     pub ultra_routes: Mutex<HashSet<String>>,
     pub ai_client: Option<AiClient>,
+    pub ai_api_token: Option<String>,
     pub rt: Handle,
+    pub ai_rate_limiter: RateLimiter,
 }
 
 impl AppState {
