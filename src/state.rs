@@ -3,8 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::ai::AiClient;
 use crate::colors::{strip_ansi, ServiceColors};
 use crate::config::Config;
 use crate::filters::Filters;
@@ -93,6 +95,8 @@ pub struct AppState {
     pub monitoring_enabled: AtomicBool,
     pub ultra_mode: AtomicBool,
     pub ultra_routes: Mutex<HashSet<String>>,
+    pub ai_client: Option<AiClient>,
+    pub rt: Handle,
 }
 
 impl AppState {

@@ -1,3 +1,4 @@
+mod ai;
 mod colors;
 mod config;
 mod filters;
@@ -12,6 +13,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use ai::AiClient;
 use colors::ServiceColors;
 use filters::Filters;
 use logger::FileLogger;
@@ -26,6 +28,8 @@ fn pause_on_exit() {
 }
 
 fn main() {
+    let _ = dotenvy::dotenv();
+
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("FATAL: {info}");
         eprintln!("{msg}");
@@ -51,6 +55,27 @@ fn main() {
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+    let ai_cfg = cfg.ai.clone().unwrap_or_default();
+    let ai_client = if ai_cfg.enabled.unwrap_or(true) {
+        let keys: &[&str] = &["DEEPSEEK_API_KEY", "AI_API_KEY", "OPENAI_API_KEY"];
+        let api_key = keys
+            .iter()
+            .find_map(|k| std::env::var(k).ok())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_default();
+        if api_key.is_empty() {
+            eprintln!("AI: no API key found (set DEEPSEEK_API_KEY or AI_API_KEY). AI features disabled.");
+            None
+        } else {
+            eprintln!("AI: enabled ({})", ai_cfg.model.as_deref().unwrap_or("deepseek-chat"));
+            Some(AiClient::new(ai_cfg, api_key))
+        }
+    } else {
+        None
+    };
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
     let app = Arc::new(AppState {
         port,
         start: Instant::now(),
@@ -64,11 +89,12 @@ fn main() {
         monitoring_enabled: std::sync::atomic::AtomicBool::new(false),
         ultra_mode: std::sync::atomic::AtomicBool::new(false),
         ultra_routes: Mutex::new(HashSet::new()),
+        ai_client,
+        rt: rt.handle().clone(),
     });
 
     app.logger.init_session();
 
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let server_app = app.clone();
     rt.spawn(async move {
         proxy::run(server_app).await;

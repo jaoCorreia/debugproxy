@@ -18,5 +18,16 @@
     "theme": "cosmic",
     "scenes": "all",
     "wakeOnLog": true
+  },
+  "ai": {
+    "enabled": true,
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "endpoint": "https://api.deepseek.com/v1/chat/completions",
+    "maxContextLines": 200,
+    "forwarding": {
+      "enabled": false,
+      "webhookUrl": ""
+    }
   }
 }

@@ -2,6 +2,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::ai::AiConfig;
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ScreensaverConfig {
@@ -25,6 +27,7 @@ pub struct Config {
     pub port: Option<u16>,
     pub colors: HashMap<String, String>,
     pub screensaver: Option<ScreensaverConfig>,
+    pub ai: Option<AiConfig>,
 }
 
 pub fn base_dir() -> PathBuf {

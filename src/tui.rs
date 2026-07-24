@@ -291,6 +291,7 @@ fn event_loop(
                                     ui.sidebar_scroll = ui.sidebar_scroll.saturating_sub(5);
                                 }
                                 KeyCode::Char('y') => copy_selection(&mut ui),
+                                KeyCode::Char('a') => analyze_selection(&app, &ui),
                                 KeyCode::Char('m') => {
                                     let was_on = app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed);
                                     app.monitoring_enabled.store(!was_on, std::sync::atomic::Ordering::Relaxed);
@@ -654,9 +655,273 @@ fn execute_command(app: &Arc<AppState>, ui: &mut Ui, cmd: &str, w: u16, h: u16) 
             app.ultra_mode.store(true, std::sync::atomic::Ordering::Relaxed);
             app.log("Ultra mode: ON (all routes)");
         }
+    } else if action == "ask" || action == "ai" {
+        let question = if parts.len() > 1 {
+            parts[1..].join(" ")
+        } else {
+            String::new()
+        };
+        if question.is_empty() {
+            app.log(&format!("{YELLOW}Use: ask <sua pergunta>{RESET}"));
+        } else {
+            ask_ai(app, &question, None);
+        }
+    } else if action == "fwd" && parts.len() >= 2 {
+        let urgency = parts[1].to_lowercase();
+        let message = if parts.len() > 2 {
+            parts[2..].join(" ")
+        } else {
+            String::new()
+        };
+        let valid = ["low", "medium", "high", "critical"];
+        if !valid.contains(&urgency.as_str()) {
+            app.log(&format!("{YELLOW}Use: fwd low|medium|high|critical <mensagem>{RESET}"));
+            return;
+        }
+        forward_ai_observation(app, &message, &urgency);
+    } else if action == "report" {
+        report_ai(app);
     } else {
         app.filters.lock().unwrap().handle_command(cmd);
     }
+}
+
+fn ask_ai(app: &Arc<AppState>, question: &str, context_override: Option<String>) {
+    let app = app.clone();
+    let Some(ai) = app.ai_client.as_ref() else {
+        app.log(&format!("{YELLOW}AI indisponível: configure DEEPSEEK_API_KEY no .env{RESET}"));
+        return;
+    };
+    if !ai.is_configured() {
+        app.log(&format!("{YELLOW}AI indisponível: configure DEEPSEEK_API_KEY no .env{RESET}"));
+        return;
+    }
+
+    let max_lines = ai.max_context_lines();
+    let context = context_override.unwrap_or_else(|| {
+        app.logger
+            .read_tail(max_lines)
+            .lines()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+
+    let question = question.to_string();
+    app.log("\x1b[35m* AI: pensando...\x1b[0m");
+    let rt = app.rt.clone();
+    rt.spawn(async move {
+        let Some(ai) = app.ai_client.as_ref() else { return };
+        match ai.chat(&context, &question).await {
+            Ok(response) => {
+                if !response.text.is_empty() && response.text != "(no response)" {
+                    app.log("\x1b[35m* AI:\x1b[0m");
+                    app.log_multiline(&format!("\x1b[35m{}\x1b[0m", response.text));
+                    app.log("");
+                }
+                for tc in &response.tool_calls {
+                    execute_tool_call(&app, tc);
+                }
+            }
+            Err(e) => {
+                app.log(&format!("\x1b[31mAI erro: {e}\x1b[0m"));
+            }
+        }
+    });
+}
+
+fn forward_ai_observation(app: &Arc<AppState>, message: &str, urgency: &str) {
+    let app = app.clone();
+    let Some(ai) = app.ai_client.as_ref() else {
+        app.log(&format!("{YELLOW}AI indisponível{RESET}"));
+        return;
+    };
+    if !ai.forwarding_enabled() {
+        app.log(&format!("{YELLOW}Forwarding não configurado. Adicione 'forwarding' ao config.json{RESET}"));
+        return;
+    }
+
+    let message = message.to_string();
+    let urgency = urgency.to_string();
+
+    let rt = app.rt.clone();
+    rt.spawn(async move {
+        let Some(ai) = app.ai_client.as_ref() else { return };
+        match ai.forward(&message, &urgency).await {
+            Ok(()) => {
+                app.log(&format!("\x1b[35m>> Forwarded [{urgency}]: {message}\x1b[0m"));
+            }
+            Err(e) => {
+                app.log(&format!("\x1b[31mForward erro: {e}\x1b[0m"));
+            }
+        }
+    });
+}
+
+fn execute_tool_call(app: &Arc<AppState>, tc: &crate::ai::ToolCall) {
+    match tc.name.as_str() {
+        "toggle_service" => {
+            if let Some(action) = tc.arguments.get("action").and_then(|v| v.as_str()) {
+                let action = action.to_string();
+                app.filters.lock().unwrap().handle_command(&action);
+                app.log(&format!("\x1b[35m+ AI executou: toggle {action}\x1b[0m"));
+            }
+        }
+        "add_route" => {
+            let prefix = tc.arguments.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
+            let target = tc.arguments.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            let label = tc.arguments.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            if !prefix.is_empty() && !target.is_empty() {
+                match add_route(prefix, target, label) {
+                    Ok(route) => {
+                        app.filters.lock().unwrap().rebuild();
+                        app.log(&format!("\x1b[35m+ AI executou: + Route {} → {}\x1b[0m", route.prefix, route.target));
+                    }
+                    Err(e) => app.log(&format!("\x1b[31mAI tool error: {e}\x1b[0m")),
+                }
+            }
+        }
+        "remove_route" => {
+            if let Some(prefix) = tc.arguments.get("prefix").and_then(|v| v.as_str()) {
+                match remove_route(prefix) {
+                    Ok(()) => {
+                        app.filters.lock().unwrap().rebuild();
+                        app.log(&format!("\x1b[35m+ AI executou: - Route {prefix}\x1b[0m"));
+                    }
+                    Err(e) => app.log(&format!("\x1b[31mAI tool error: {e}\x1b[0m")),
+                }
+            }
+        }
+        "enable_monitoring" => {
+            if let Some(enable) = tc.arguments.get("enable").and_then(|v| v.as_bool()) {
+                app.monitoring_enabled.store(enable, std::sync::atomic::Ordering::Relaxed);
+                app.log(&format!("\x1b[35m+ AI executou: monitor {}\x1b[0m", if enable { "ON" } else { "OFF" }));
+            }
+        }
+        "forward_observation" => {
+            let message = tc.arguments.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let urgency = tc.arguments.get("urgency").and_then(|v| v.as_str()).unwrap_or("medium");
+            if !message.is_empty() {
+                forward_ai_observation(app, message, urgency);
+            }
+        }
+        _ => {
+            app.log(&format!("\x1b[33mAI sugeriu ação desconhecida: {}\x1b[0m", tc.name));
+        }
+    }
+}
+
+fn analyze_selection(app: &Arc<AppState>, ui: &Ui) {
+    let Some((start, end)) = ui.selection else {
+        app.log(&format!("{YELLOW}Selecione linhas primeiro (arraste com mouse){RESET}"));
+        return;
+    };
+    if ui.lines.is_empty() {
+        return;
+    }
+    let end = end.min(ui.lines.len() - 1);
+    if start > end {
+        return;
+    }
+    let selected: String = ui.lines[start..=end]
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if selected.trim().is_empty() {
+        app.log(&format!("{YELLOW}Seleção vazia{RESET}"));
+        return;
+    }
+    let context = format!("Linhas selecionadas pelo usuário:\n```\n{}\n```", selected);
+    ask_ai(app, "Analise estas linhas de log e identifique problemas, erros ou padrões relevantes.", Some(context));
+}
+
+fn report_ai(app: &Arc<AppState>) {
+    let app = app.clone();
+    let Some(ai) = app.ai_client.as_ref() else {
+        app.log(&format!("{YELLOW}AI indisponível: configure DEEPSEEK_API_KEY no .env{RESET}"));
+        return;
+    };
+    if !ai.is_configured() {
+        app.log(&format!("{YELLOW}AI indisponível: configure DEEPSEEK_API_KEY no .env{RESET}"));
+        return;
+    }
+
+    let mut report = String::new();
+
+    report.push_str(&format!("=== Proxy Status ===\n"));
+    report.push_str(&format!("Port: {}\n", app.port));
+    report.push_str(&format!("Uptime: {}s\n", app.uptime_secs()));
+    report.push_str(&format!("Total Requests: {}\n", app.request_total()));
+    report.push_str(&format!("Log Mode: {}\n", app.logger.get_mode()));
+    if let Some(ref p) = app.logger.get_session_file() {
+        report.push_str(&format!("Log File: {}\n", p.display()));
+    }
+
+    report.push_str(&format!("\n=== Service Filters ===\n"));
+    let filters = app.filters.lock().unwrap();
+    for (label, enabled) in &filters.state {
+        report.push_str(&format!("  {} {}\n", if *enabled { "ON " } else { "OFF" }, label));
+    }
+    drop(filters);
+
+    report.push_str(&format!("\n=== Routes ===\n"));
+    for r in &get_routes() {
+        report.push_str(&format!("  {} → {}\n", r.prefix, r.target));
+    }
+
+    let mon_on = app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    report.push_str(&format!("\n=== Monitoring ===\n"));
+    report.push_str(&format!("  Enabled: {}\n", mon_on));
+    if mon_on {
+        let transfers = app.transfer_tracker.lock().unwrap().snapshot();
+        if !transfers.is_empty() {
+            report.push_str("  Recent transfers:\n");
+            for t in transfers.iter().take(20) {
+                let status = t.status.map(|s| s.to_string()).unwrap_or_else(|| "⟳".to_string());
+                let dur = t.duration_ms.map(|d| format!("{d}ms")).unwrap_or_default();
+                let size = t.size.map(|s| format!("{}B", s)).unwrap_or_default();
+                report.push_str(&format!("    {} {} {} {} {} {}\n", t.method, t.path, status, dur, size, t.route_label));
+            }
+        }
+    }
+
+    let max_lines = ai.max_context_lines().saturating_sub(report.lines().count());
+    let logs = app.logger.read_tail(max_lines);
+    report.push_str(&format!("\n=== Recent Logs ({max_lines} lines) ===\n"));
+    report.push_str(&logs);
+
+    let prompt = "Generate a structured diagnostic report covering:\n\
+        1. Overall health summary\n\
+        2. Error patterns found (HTTP errors, timeouts)\n\
+        3. Performance observations (slow requests, bottlenecks)\n\
+        4. Recommendations (what to fix, what to monitor)\n\
+        5. Risk assessment (critical/high/medium/low)\n\
+        Keep it concise and actionable. Use bullet points.";
+
+    app.log("\x1b[35m== AI: gerando relatório...\x1b[0m");
+    let rt = app.rt.clone();
+    rt.spawn(async move {
+        let Some(ai) = app.ai_client.as_ref() else { return };
+        match ai.chat(&report, prompt).await {
+            Ok(response) => {
+                if !response.text.is_empty() && response.text != "(no response)" {
+                    app.log("\x1b[35m═══════════════════════════════════\x1b[0m");
+                    app.log("\x1b[35m== RELATÓRIO DIAGNÓSTICO\x1b[0m");
+                    app.log("\x1b[35m═══════════════════════════════════\x1b[0m");
+                    app.log_multiline(&format!("\x1b[35m{}\x1b[0m", response.text));
+                    app.log("\x1b[35m═══════════════════════════════════\x1b[0m");
+                    app.log("");
+                }
+                for tc in &response.tool_calls {
+                    execute_tool_call(&app, tc);
+                }
+            }
+            Err(e) => {
+                app.log(&format!("\x1b[31mAI erro: {e}\x1b[0m"));
+            }
+        }
+    });
 }
 
 fn draw(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui) {
@@ -1064,6 +1329,15 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui, area: Rect) {
         Span::styled("all | none | saver", bright),
     ]));
     lines.push(Line::default());
+    lines.push(Line::styled("▸ AI", heading));
+    lines.push(Line::from(vec![
+        Span::styled("  a ", Style::default().fg(ACCENT)),
+        Span::styled("analyze selection", dim),
+    ]));
+    lines.push(Line::styled("  ask <pergunta>  consultar IA", dim));
+    lines.push(Line::styled("  report          relatório diagnóstico", dim));
+    lines.push(Line::styled("  fwd <nivel> <msg>  forward obs", dim));
+    lines.push(Line::default());
     lines.push(Line::from(vec![
         Span::styled("  / ", Style::default().fg(ACCENT)),
         Span::styled("search | ", dim),
@@ -1077,8 +1351,10 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui, area: Rect) {
         Span::styled("jump bottom", dim),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  y ", Style::default().fg(ACCENT)),
-        Span::styled("copy selection", dim),
+        Span::styled("  a ", Style::default().fg(ACCENT)),
+        Span::styled("analyze sel. | ", dim),
+        Span::styled("ask ", Style::default().fg(ACCENT)),
+        Span::styled("AI question", dim),
     ]));
 
     // ── File ──
@@ -1546,10 +1822,13 @@ fn draw_command_bar(f: &mut Frame, ui: &Ui, area: Rect) {
             "ENTER confirm  ESC cancel",
             Style::default().fg(MUTED),
         ),
-        Mode::View => Line::styled(
-            "ENTER  command mode",
-            Style::default().fg(MUTED),
-        ),
+        Mode::View => Line::from(vec![
+            Span::styled("ENTER  command mode  ", Style::default().fg(MUTED)),
+            Span::styled("a ", Style::default().fg(ACCENT)),
+            Span::styled("analyze sel  ", Style::default().fg(MUTED)),
+            Span::styled("ask ", Style::default().fg(ACCENT)),
+            Span::styled("AI question", Style::default().fg(MUTED)),
+        ]),
     };
     let border_color = if ui.mode == Mode::Command || ui.mode == Mode::Search {
         ACCENT

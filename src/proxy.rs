@@ -46,6 +46,10 @@ pub async fn run(app: Arc<AppState>) {
         .route("/api/status", get(api_status))
         .route("/api/logs", get(api_logs))
         .route("/api/cmd", post(api_cmd))
+        .route("/api/ai/ask", post(api_ai_ask))
+        .route("/api/ai/status", get(api_ai_status))
+        .route("/api/ai/forward", post(api_ai_forward))
+        .route("/api/ai/report", post(api_ai_report_handler))
         .fallback(any(proxy_handler))
         .with_state(state);
 
@@ -417,6 +421,234 @@ async fn api_cmd(State(state): State<ServerState>, body: axum::body::Bytes) -> R
     app.filters.lock().unwrap().handle_command(cmd);
     let filters = app.filters.lock().unwrap().as_json();
     json_error(StatusCode::OK, json!({ "ok": true, "cmd": cmd, "filters": filters }))
+}
+
+async fn api_ai_status(State(state): State<ServerState>) -> Response {
+    let app = &state.app;
+    let body = match &app.ai_client {
+        Some(ai) => json!({
+            "configured": true,
+            "model": ai.model(),
+            "endpoint": ai.endpoint(),
+            "forwardingEnabled": ai.forwarding_enabled(),
+            "hasApiKey": ai.is_configured(),
+            "lastResponse": ai.last_response_text(),
+        }),
+        None => json!({
+            "configured": false,
+            "error": "AI not configured. Set DEEPSEEK_API_KEY env var and ai section in config.json"
+        }),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string_pretty(&body).unwrap()))
+        .unwrap()
+}
+
+async fn api_ai_ask(State(state): State<ServerState>, body: axum::body::Bytes) -> Response {
+    let app = &state.app;
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, json!({ "error": "Invalid JSON body" })),
+    };
+
+    let question = parsed.get("question").and_then(|q| q.as_str()).unwrap_or("");
+    if question.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, json!({ "error": "Missing \"question\" field" }));
+    }
+
+    let Some(ai) = &app.ai_client else {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "AI not configured" }));
+    };
+
+    let context = parsed
+        .get("context")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            app.logger
+                .read_tail(ai.max_context_lines())
+        });
+
+    match ai.chat(&context, question).await {
+        Ok(response) => {
+            let resp = json!({
+                "ok": true,
+                "response": response.text,
+                "toolCalls": response.tool_calls.iter().map(|tc| json!({
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                })).collect::<Vec<_>>(),
+            });
+
+            for tc in &response.tool_calls {
+                execute_ai_tool(app, tc);
+            }
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string_pretty(&resp).unwrap()))
+                .unwrap()
+        }
+        Err(e) => json_error(StatusCode::BAD_GATEWAY, json!({ "error": e })),
+    }
+}
+
+async fn api_ai_forward(State(state): State<ServerState>, body: axum::body::Bytes) -> Response {
+    let app = &state.app;
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, json!({ "error": "Invalid JSON body" })),
+    };
+
+    let message = parsed.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    if message.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, json!({ "error": "Missing \"message\" field" }));
+    }
+
+    let urgency = parsed.get("urgency").and_then(|u| u.as_str()).unwrap_or("medium");
+
+    let Some(ai) = &app.ai_client else {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "AI not configured" }));
+    };
+
+    if !ai.forwarding_enabled() {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "Forwarding not configured" }));
+    }
+
+    match ai.forward(message, urgency).await {
+        Ok(()) => {
+            app.log(&format!("\x1b[35m>> AI Forward [{urgency}]: {message}\x1b[0m"));
+            json_error(StatusCode::OK, json!({ "ok": true, "forwarded": true }))
+        }
+        Err(e) => json_error(StatusCode::BAD_GATEWAY, json!({ "error": e })),
+    }
+}
+
+fn build_report_context(app: &crate::state::AppState) -> String {
+    use std::fmt::Write;
+    let mut report = String::new();
+    let _ = writeln!(report, "=== Proxy Status ===");
+    let _ = writeln!(report, "Port: {}", app.port);
+    let _ = writeln!(report, "Uptime: {}s", app.uptime_secs());
+    let _ = writeln!(report, "Total Requests: {}", app.request_total());
+
+    let _ = writeln!(report, "=== Routes ===");
+    for r in &get_routes() {
+        let _ = writeln!(report, "  {} → {}", r.prefix, r.target);
+    }
+
+    let _ = writeln!(report, "=== Filters ===");
+    let filters = app.filters.lock().unwrap();
+    for (label, enabled) in &filters.state {
+        let _ = writeln!(report, "  {} {}", if *enabled { "ON" } else { "OFF" }, label);
+    }
+    drop(filters);
+
+    let mon_on = app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = writeln!(report, "=== Monitoring: {} ===", if mon_on { "ON" } else { "OFF" });
+    if mon_on {
+        let transfers = app.transfer_tracker.lock().unwrap().snapshot();
+        for t in transfers.iter().take(20) {
+            let status = t.status.map(|s| s.to_string()).unwrap_or_else(|| "???".to_string());
+            let _ = writeln!(report, "  {} {} {}", t.method, t.path, status);
+        }
+    }
+
+    let _ = writeln!(report, "=== Recent Logs ===");
+    let _ = writeln!(report, "{}", app.logger.read_tail(200));
+
+    report
+}
+
+async fn api_ai_report_handler(State(state): State<ServerState>, body: axum::body::Bytes) -> Response {
+    let app = &state.app;
+    let Some(ai) = &app.ai_client else {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "AI not configured" }));
+    };
+
+    let extra_context = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("context").and_then(|c| c.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    let mut report = build_report_context(app);
+    if !extra_context.is_empty() {
+        use std::fmt::Write;
+        let _ = writeln!(report, "\n=== Additional Context ===\n{extra_context}");
+    }
+
+    let prompt = "Generate a structured diagnostic report covering: overall health, error patterns, performance, recommendations, risk assessment. Concise and actionable.";
+
+    match ai.chat(&report, prompt).await {
+        Ok(response) => {
+            app.log("\x1b[35m== AI Report generated\x1b[0m");
+            json_error(StatusCode::OK, json!({
+                "ok": true,
+                "report": response.text,
+                "toolCalls": response.tool_calls.iter().map(|tc| json!({
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                })).collect::<Vec<_>>(),
+            }))
+        }
+        Err(e) => json_error(StatusCode::BAD_GATEWAY, json!({ "error": e })),
+    }
+}
+
+fn execute_ai_tool(app: &AppState, tc: &crate::ai::ToolCall) {
+    match tc.name.as_str() {
+        "toggle_service" => {
+            if let Some(action) = tc.arguments.get("action").and_then(|v| v.as_str()) {
+                let action = action.to_string();
+                app.filters.lock().unwrap().handle_command(&action);
+                app.log(&format!("\x1b[35m+ AI: toggle {action}\x1b[0m"));
+            }
+        }
+        "add_route" => {
+            let prefix = tc.arguments.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
+            let target = tc.arguments.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            let label = tc.arguments.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            if !prefix.is_empty() && !target.is_empty() {
+                match crate::routes::add_route(prefix, target, label) {
+                    Ok(route) => {
+                        app.filters.lock().unwrap().rebuild();
+                        app.log(&format!("\x1b[35m+ AI: + Route {} → {}\x1b[0m", route.prefix, route.target));
+                    }
+                    Err(e) => app.log(&format!("\x1b[31mAI tool error: {e}\x1b[0m")),
+                }
+            }
+        }
+        "remove_route" => {
+            if let Some(prefix) = tc.arguments.get("prefix").and_then(|v| v.as_str()) {
+                match crate::routes::remove_route(prefix) {
+                    Ok(()) => {
+                        app.filters.lock().unwrap().rebuild();
+                        app.log(&format!("\x1b[35m+ AI: - Route {prefix}\x1b[0m"));
+                    }
+                    Err(e) => app.log(&format!("\x1b[31mAI tool error: {e}\x1b[0m")),
+                }
+            }
+        }
+        "enable_monitoring" => {
+            if let Some(enable) = tc.arguments.get("enable").and_then(|v| v.as_bool()) {
+                app.monitoring_enabled.store(enable, std::sync::atomic::Ordering::Relaxed);
+                app.log(&format!("\x1b[35m+ AI: monitor {}\x1b[0m", if enable { "ON" } else { "OFF" }));
+            }
+        }
+        "forward_observation" => {
+            let message = tc.arguments.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let urgency = tc.arguments.get("urgency").and_then(|v| v.as_str()).unwrap_or("medium");
+            if !message.is_empty() {
+                app.log(&format!("\x1b[35m>> AI quer forward [{urgency}]: {message}\x1b[0m"));
+            }
+        }
+        _ => {
+            app.log(&format!("\x1b[33mAI sugeriu ação desconhecida: {}\x1b[0m", tc.name));
+        }
+    }
 }
 
 async fn proxy_handler(State(state): State<ServerState>, req: Request) -> Response {
