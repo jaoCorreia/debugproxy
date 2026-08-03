@@ -19,7 +19,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::UnboundedReceiver;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::colors::{GREEN, RED, RESET, YELLOW};
 use crate::filters::{LOGCAT_KEY, LOGS_KEY};
@@ -37,6 +37,13 @@ const ACCENT_SOFT: Color = Color::Rgb(196, 138, 112);
 const VIOLET: Color = Color::Rgb(150, 111, 214);
 const MUTED: Color = Color::Rgb(130, 128, 138);
 const OK: Color = Color::Rgb(120, 200, 140);
+const WARN: Color = Color::Rgb(200, 180, 100);
+const ERR: Color = Color::Rgb(220, 100, 100);
+
+const TIMELINE_WINDOW_MS: u64 = 15_000;
+const TIMELINE_PATH_W: usize = 18;
+const TIMELINE_INFO_W: usize = 10;
+const TIMELINE_MIN_BAR_W: usize = 4;
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FLASH_FRAMES: u8 = 8;
@@ -1265,12 +1272,7 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui, area: Rect) {
                     Some(s) => format!("{s} "),
                 };
                 let dur_str = t.duration_ms.map(|d| format!("{d}ms")).unwrap_or_default();
-                let size_str = match t.size {
-                    Some(sz) if sz >= 1024 * 1024 => format!("{:.1}M", sz as f64 / 1024.0 / 1024.0),
-                    Some(sz) if sz >= 1024 => format!("{}K", sz / 1024),
-                    Some(sz) => format!("{sz}B"),
-                    None => String::new(),
-                };
+                let size_str = format_size(t.size, true);
                 let trail = if t.status.is_none() {
                     "…".to_string()
                 } else if size_str.is_empty() {
@@ -1278,12 +1280,7 @@ fn draw_sidebar(f: &mut Frame, app: &Arc<AppState>, ui: &mut Ui, area: Rect) {
                 } else {
                     format!("{dur_str} {size_str}")
                 };
-                let s_color = match t.status {
-                    None => ACCENT,
-                    Some(s) if (200..300).contains(&s) => OK,
-                    Some(s) if (400..500).contains(&s) => Color::Rgb(200, 180, 100),
-                    Some(_) => Color::Rgb(220, 100, 100),
-                };
+                let s_color = status_color(t.status);
                 lines.push(Line::from(vec![
                     Span::raw(" "),
                     Span::styled(status_str, Style::default().fg(s_color)),
@@ -1688,122 +1685,236 @@ fn draw_log(f: &mut Frame, ui: &mut Ui, area: Rect) {
     f.render_widget(Paragraph::new(Text::from(visible)).block(block), area);
 }
 
-fn draw_ultra_graph(f: &mut Frame, app: &Arc<AppState>, _ui: &Ui, area: Rect) {
-    let tracker = app.transfer_tracker.lock().unwrap();
-    let transfers = tracker.snapshot();
-    drop(tracker);
-
-    let now_ms = app.uptime_millis();
-    let window_ms: u64 = 15_000;
-    let viewport_w = area.width.saturating_sub(2) as usize;
-    let viewport_h = area.height.saturating_sub(2) as usize;
-    if viewport_w < 10 || viewport_h == 0 {
-        return;
+fn status_color(status: Option<u16>) -> Color {
+    match status {
+        Some(s) if (200..300).contains(&s) => OK,
+        Some(s) if (400..500).contains(&s) => WARN,
+        Some(_) => ERR,
+        None => ACCENT,
     }
+}
 
-    let filtered: Vec<_> = {
-        let ultra_routes = app.ultra_routes.lock().unwrap();
-        transfers
-            .iter()
-            .filter(|t| {
-                ultra_routes.is_empty() || ultra_routes.contains(&t.route_label)
-            })
-            .collect()
-    };
-
-    let mut rows: Vec<Line<'static>> = vec![
-        Line::styled(
-            format!(" Timeline · {:>5}ms ───────────────────────────────────── 0ms", window_ms),
-            Style::default().fg(MUTED),
-        ),
-    ];
-
-    if filtered.is_empty() {
-        let mon_on = app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed);
-        rows.push(Line::styled(
-            if mon_on {
-                "  waiting for traffic…"
-            } else {
-                "  enable monitoring (m)"
-            },
-            Style::default().fg(MUTED),
-        ));
+fn format_size(size: Option<usize>, compact: bool) -> String {
+    let (mb, kb) = if compact { ("M", "K") } else { ("MB", "KB") };
+    match size {
+        Some(sz) if sz >= 1024 * 1024 => format!("{:.1}{mb}", sz as f64 / 1024.0 / 1024.0),
+        Some(sz) if sz >= 1024 => format!("{}{kb}", sz / 1024),
+        Some(sz) => format!("{sz}B"),
+        None => String::new(),
     }
+}
 
-    for t in filtered.iter().rev().take(viewport_h.saturating_sub(1)) {
-        let elapsed = now_ms.saturating_sub(t.start_ms);
-        if elapsed > window_ms + (t.duration_ms.unwrap_or(0) as u64) {
+/// Truncates `s` to at most `max_w` terminal columns, appending "…" if cut.
+fn truncate_w(s: &str, max_w: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_w {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > max_w.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Pads `s` with spaces up to `w` terminal columns (no truncation).
+fn pad_w(s: &str, w: usize) -> String {
+    let pad = w.saturating_sub(UnicodeWidthStr::width(s));
+    format!("{s}{}", " ".repeat(pad))
+}
+
+fn tick_positions(bar_w: usize, tick_count: usize) -> Vec<usize> {
+    if tick_count <= 1 || bar_w < 2 {
+        return vec![0];
+    }
+    let max_x = bar_w - 1;
+    (0..tick_count)
+        .map(|i| ((max_x as f64) * i as f64 / (tick_count - 1) as f64).round() as usize)
+        .collect()
+}
+
+fn axis_labels(
+    window_ms: u64,
+    bar_w: usize,
+    tick_count: usize,
+    left_w: usize,
+    inner_w: usize,
+) -> String {
+    let positions = tick_positions(bar_w, tick_count);
+    let mut row: Vec<char> = vec![' '; inner_w];
+    let mut prev_end: Option<usize> = None;
+    for (i, x) in positions.iter().enumerate() {
+        let secs = window_ms as f64 / 1000.0 * (1.0 - i as f64 / (tick_count - 1) as f64);
+        let label = if i == tick_count - 1 {
+            "agora".to_string()
+        } else {
+            format!("{secs:.0}s")
+        };
+        let len = label.len();
+        let mut start = left_w.saturating_add(*x).saturating_add(1).saturating_sub(len);
+        if start < left_w {
+            start = left_w;
+        }
+        if start + len > inner_w {
+            start = inner_w.saturating_sub(len);
+        }
+        if prev_end.is_some_and(|pe| start <= pe) {
             continue;
         }
-
-        let status_color = match t.status {
-            Some(s) if (200..300).contains(&s) => OK,
-            Some(s) if (400..500).contains(&s) => Color::Rgb(200, 180, 100),
-            Some(_) => Color::Rgb(220, 100, 100),
-            None => ACCENT,
-        };
-        let status_str = match t.status {
-            None => " ⟳ ".to_string(),
-            Some(s) => format!("{s}"),
-        };
-
-        let bar_start_f = elapsed.min(window_ms) as f64;
-        let bar_x = (viewport_w as f64 * (1.0 - bar_start_f / window_ms as f64)) as usize;
-        let bar_x = bar_x.min(viewport_w.saturating_sub(1));
-
-        let bar_dur = t.duration_ms.unwrap_or(0).min(window_ms as u128) as f64;
-        let bar_w = (viewport_w as f64 * bar_dur / window_ms as f64) as usize;
-        let bar_w = bar_w.max(1).min(viewport_w.saturating_sub(bar_x));
-
-        let label = match t.path.len() {
-            0..=22 => t.path.clone(),
-            _ => format!("{}…", &t.path[..21]),
-        };
-        let dur_str = t.duration_ms.map(|d| format!("{d}ms")).unwrap_or_default();
-        let size_str = match t.size {
-            Some(sz) if sz >= 1024 * 1024 => format!("{:.1}MB", sz as f64 / 1024.0 / 1024.0),
-            Some(sz) if sz >= 1024 => format!("{}KB", sz / 1024),
-            Some(sz) => format!("{sz}B"),
-            None => String::new(),
-        };
-        let info = if size_str.is_empty() {
-            dur_str
-        } else {
-            format!("{dur_str} {size_str}")
-        };
-
-        let mut chars: Vec<char> = vec![' '; viewport_w];
-        for i in bar_x..(bar_x + bar_w).min(viewport_w) {
-            chars[i] = '█';
+        for (j, c) in label.chars().enumerate() {
+            row[start + j] = c;
         }
-        let row_str: String = chars.into_iter().collect();
+        prev_end = Some(start + len);
+    }
+    row.into_iter().collect::<String>()
+}
 
-        rows.push(Line::from(vec![
-            Span::styled(
-                format!("{status_str:>3} "),
-                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+fn transfer_row(
+    t: &crate::state::Transfer,
+    now_ms: u64,
+    window_ms: u64,
+    path_w: usize,
+    info_w: usize,
+    bar_w: usize,
+) -> Line<'static> {
+    let status_str = match t.status {
+        None => " ⟳  ".to_string(),
+        Some(s) => format!("{s:>3} "),
+    };
+    let method_disp: String = t.method.chars().take(4).collect();
+    let method_str = pad_w(&method_disp, 4);
+    let path_disp = sanitize_cells(&truncate_w(&t.path, path_w));
+    let dur_str = t.duration_ms.map(|d| format!("{d}ms")).unwrap_or_default();
+    let size_str = format_size(t.size, false);
+    let info = if size_str.is_empty() {
+        dur_str
+    } else {
+        format!("{dur_str} {size_str}")
+    };
+    let info_disp = sanitize_cells(&truncate_w(&info, info_w));
+
+    let elapsed = now_ms.saturating_sub(t.start_ms);
+    let x = (bar_w as f64 * (1.0 - elapsed.min(window_ms) as f64 / window_ms as f64)) as usize;
+    let x = x.min(bar_w.saturating_sub(1));
+    let end = if t.status.is_some() {
+        let dur = t.duration_ms.unwrap_or(0).min(window_ms as u128) as f64;
+        let w = (bar_w as f64 * dur / window_ms as f64) as usize;
+        (x + w.max(1)).min(bar_w)
+    } else {
+        bar_w
+    };
+    let mut bar_chars = vec![' '; bar_w];
+    bar_chars[x..end].fill('█');
+    let bar_str: String = bar_chars.into_iter().collect();
+    let s_color = status_color(t.status);
+    let bar_span = if t.status.is_some() {
+        Span::styled(bar_str, Style::default().bg(s_color).fg(Color::Black))
+    } else {
+        Span::styled(bar_str, Style::default().fg(ACCENT))
+    };
+
+    Line::from(vec![
+        Span::styled(status_str, Style::default().fg(s_color).add_modifier(Modifier::BOLD)),
+        Span::styled(method_str, Style::default().fg(Color::White)),
+        Span::styled(pad_w(&path_disp, path_w), Style::default().fg(Color::White)),
+        Span::styled(pad_w(&info_disp, info_w), Style::default().fg(MUTED)),
+        bar_span,
+    ])
+}
+
+fn draw_ultra_graph(f: &mut Frame, app: &Arc<AppState>, _ui: &Ui, area: Rect) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let window_ms = TIMELINE_WINDOW_MS;
+    let mon_on = app.monitoring_enabled.load(std::sync::atomic::Ordering::Relaxed);
+
+    let mut rows: Vec<Line<'static>> = vec![Line::from(vec![
+        Span::styled(" ▪ 2xx ", Style::default().fg(OK)),
+        Span::styled("▪ 4xx ", Style::default().fg(WARN)),
+        Span::styled("▪ outros ", Style::default().fg(ERR)),
+        Span::styled("▪ ativo", Style::default().fg(ACCENT)),
+    ])];
+
+    if inner_w < 30 {
+        rows.push(Line::styled(
+            "  window too narrow for the chart",
+            Style::default().fg(MUTED),
+        ));
+    } else if inner_h < 3 {
+        rows.clear();
+    } else {
+        let tracker = app.transfer_tracker.lock().unwrap();
+        let transfers = tracker.snapshot();
+        drop(tracker);
+
+        let now_ms = app.uptime_millis();
+        let filtered: Vec<_> = {
+            let ultra_routes = app.ultra_routes.lock().unwrap();
+            transfers
+                .iter()
+                .filter(|t| ultra_routes.is_empty() || ultra_routes.contains(&t.route_label))
+                .collect()
+        };
+        let is_in_window = |t: &&crate::state::Transfer| {
+            now_ms.saturating_sub(t.start_ms) <= window_ms + t.duration_ms.unwrap_or(0) as u64
+        };
+
+        let in_window: Vec<_> = filtered.iter().filter(|t| is_in_window(t)).collect();
+        let active = in_window.iter().filter(|t| t.status.is_none()).count();
+        let errors = in_window
+            .iter()
+            .filter(|t| matches!(t.status, Some(s) if s >= 300))
+            .count();
+        rows.push(Line::styled(
+            format!(
+                " Timeline {:.0}s · {} req · {active} ativos · {errors} erros",
+                window_ms as f64 / 1000.0,
+                in_window.len(),
             ),
-            Span::styled(
-                format!("{:>3} ", t.method),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled(
-                if t.status.is_none() { row_str.clone() } else { String::new() },
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(
-                if t.status.is_some() { row_str } else { String::new() },
-                Style::default().bg(status_color).fg(Color::Black),
-            ),
-            Span::styled(
-                format!(" {}", label),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled(
-                if info.is_empty() { String::new() } else { format!("  {info}") },
+            Style::default().fg(MUTED),
+        ));
+
+        if filtered.is_empty() {
+            rows.push(Line::styled(
+                if mon_on {
+                    "  waiting for traffic…"
+                } else {
+                    "  enable monitoring (m)"
+                },
                 Style::default().fg(MUTED),
-            ),
-        ]));
+            ));
+        } else {
+            let path_w = TIMELINE_PATH_W;
+            let info_w = TIMELINE_INFO_W;
+            let left_w = 8 + path_w + info_w;
+            let bar_w = inner_w.saturating_sub(left_w);
+            if bar_w >= TIMELINE_MIN_BAR_W {
+                let max_rows = inner_h.saturating_sub(4);
+                for t in in_window.iter().take(max_rows) {
+                    rows.push(transfer_row(t, now_ms, window_ms, path_w, info_w, bar_w));
+                }
+
+                let tick_count = if bar_w >= 52 { 5 } else if bar_w >= 30 { 3 } else { 2 };
+                let mut tick_row: Vec<char> = vec![' '; inner_w];
+                for x in tick_positions(bar_w, tick_count) {
+                    tick_row[left_w + x] = '┴';
+                }
+                rows.push(Line::styled(
+                    tick_row.into_iter().collect::<String>(),
+                    Style::default().fg(MUTED),
+                ));
+                rows.push(Line::styled(
+                    axis_labels(window_ms, bar_w, tick_count, left_w, inner_w),
+                    Style::default().fg(MUTED),
+                ));
+            }
+        }
     }
 
     let block = Block::default()
@@ -1816,11 +1927,7 @@ fn draw_ultra_graph(f: &mut Frame, app: &Arc<AppState>, _ui: &Ui, area: Rect) {
 
 fn draw_command_bar(f: &mut Frame, ui: &Ui, area: Rect) {
     if let Some((msg, _)) = &ui.toast {
-        let color = if msg.starts_with('✗') {
-            Color::Rgb(220, 100, 100)
-        } else {
-            OK
-        };
+        let color = if msg.starts_with('✗') { ERR } else { OK };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -2085,5 +2192,110 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|(idx, _)| *idx == 1));
         assert_eq!(line_to_plain(&rows[1].1), "89");
+    }
+
+    #[test]
+    fn status_color_maps_status_families() {
+        assert_eq!(status_color(Some(204)), OK);
+        assert_eq!(status_color(Some(404)), WARN);
+        assert_eq!(status_color(Some(301)), ERR);
+        assert_eq!(status_color(Some(503)), ERR);
+        assert_eq!(status_color(Some(100)), ERR);
+        assert_eq!(status_color(None), ACCENT);
+    }
+
+    #[test]
+    fn format_size_compact_and_full() {
+        assert_eq!(format_size(Some(512), false), "512B");
+        assert_eq!(format_size(Some(2048), false), "2KB");
+        assert_eq!(format_size(Some(3 * 1024 * 1024), false), "3.0MB");
+        assert_eq!(format_size(Some(2048), true), "2K");
+        assert_eq!(format_size(Some(3 * 1024 * 1024), true), "3.0M");
+        assert_eq!(format_size(None, false), "");
+    }
+
+    #[test]
+    fn truncate_w_keeps_short_and_ellipsizes_long() {
+        assert_eq!(truncate_w("abc", 5), "abc");
+        assert_eq!(truncate_w("abcdef", 4), "abc…");
+        // wide char (width 2) must not overflow the budget
+        assert_eq!(truncate_w("ab🚀c", 4), "ab…");
+        assert_eq!(truncate_w("ab🚀c", 5), "ab🚀c");
+    }
+
+    #[test]
+    fn pad_w_pads_to_terminal_columns() {
+        assert_eq!(pad_w("ab", 4), "ab  ");
+        assert_eq!(pad_w("🚀x", 4), "🚀x ");
+    }
+
+    #[test]
+    fn tick_positions_spans_full_width() {
+        assert_eq!(tick_positions(10, 5), vec![0, 2, 5, 7, 9]);
+        assert_eq!(tick_positions(5, 3), vec![0, 2, 4]);
+        assert_eq!(tick_positions(10, 1), vec![0]);
+        assert_eq!(tick_positions(1, 5), vec![0]);
+        // last tick always lands on the right edge (bar_w - 1)
+        let pos = tick_positions(64, 5);
+        assert_eq!(*pos.last().unwrap(), 63);
+    }
+
+    #[test]
+    fn axis_labels_rightmost_label_is_agora() {
+        // bar_w 64, left_w 36, inner_w 100: labels end on their ticks
+        let row = axis_labels(15_000, 64, 5, 36, 100);
+        assert_eq!(row.len(), 100);
+        assert!(row.contains("15s"));
+        assert!(row.contains("agora"));
+        // the "agora" label ends exactly on the right edge (its tick)
+        assert!(row.ends_with("agora"));
+    }
+
+    #[test]
+    fn axis_labels_skips_colliding_labels_on_narrow_bars() {
+        let row = axis_labels(15_000, 4, 2, 36, 40);
+        assert_eq!(row.chars().last(), Some(' '));
+        assert!(row.trim().is_empty() || row.contains('s'));
+    }
+
+    #[test]
+    fn transfer_row_keeps_info_block_width() {
+        use crate::state::Transfer;
+        let t = Transfer {
+            id: "1".into(),
+            method: "GET".into(),
+            path: "/api/users/42".into(),
+            route_label: "api".into(),
+            status: Some(200),
+            duration_ms: Some(500),
+            size: Some(2048),
+            start_ms: 0,
+        };
+        let line = transfer_row(&t, 1_000, 15_000, 18, 10, 40);
+        let plain = line_to_plain(&line);
+        // 4 (status) + 4 (method) + 18 (path) + 10 (info) + 40 (bar)
+        assert_eq!(plain.chars().count(), 76);
+        assert!(plain.contains("200"));
+        assert!(plain.contains("/api/users/42"));
+        assert!(plain.contains("500ms 2KB"));
+    }
+
+    #[test]
+    fn transfer_row_sanitizes_control_chars_in_path() {
+        use crate::state::Transfer;
+        let t = Transfer {
+            id: "1".into(),
+            method: "GET".into(),
+            path: "/evil\u{1b}]2;owned\u{7}".into(),
+            route_label: "api".into(),
+            status: Some(200),
+            duration_ms: Some(10),
+            size: None,
+            start_ms: 0,
+        };
+        let line = transfer_row(&t, 1_000, 15_000, 18, 10, 40);
+        let plain = line_to_plain(&line);
+        assert!(!plain.contains('\u{1b}'));
+        assert!(!plain.contains('\u{7}'));
     }
 }
