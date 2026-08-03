@@ -409,6 +409,7 @@ dependencies = [
  "crossterm",
  "dotenvy",
  "http",
+ "memchr",
  "rand 0.8.7",
  "ratatui",
  "regex",

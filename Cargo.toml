@@ -23,6 +23,7 @@ http = "1"
 arboard = { version = "3.6.1", default-features = false }
 unicode-width = "0.2"
 dotenvy = "0.15"
+memchr = "2"
 
 [build-dependencies]
 winres = "0.1"
